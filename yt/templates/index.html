@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Download YouTube videos as high-quality MP3 files with batch support, playlist downloads, and metadata management.">
+    <title>YT-MP3 — YouTube to MP3 Downloader</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- Toast notification container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <div class="app-wrapper">
+        <!-- ═══ Header ═══ -->
+        <header class="app-header">
+            <div class="app-logo">
+                <div class="icon">🎵</div>
+                <h1>YT-MP3</h1>
+            </div>
+            <p class="subtitle">Download YouTube audio as high-quality MP3 files</p>
+        </header>
+
+        <!-- ═══ Navigation ═══ -->
+        <nav class="nav-tabs" role="tablist">
+            <button class="nav-tab active" data-tab="download" role="tab">
+                <span class="tab-icon">⬇️</span>
+                <span class="tab-label">Download</span>
+            </button>
+            <button class="nav-tab" data-tab="search" role="tab">
+                <span class="tab-icon">🔍</span>
+                <span class="tab-label">Search</span>
+            </button>
+            <button class="nav-tab" data-tab="history" role="tab">
+                <span class="tab-icon">📋</span>
+                <span class="tab-label">History</span>
+            </button>
+        </nav>
+
+        <!-- ═══ Download Panel ═══ -->
+        <section class="tab-panel active" id="panel-download" role="tabpanel">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">🔗</span> Add Downloads</h2>
+                <form id="download-form">
+                    <div class="input-group">
+                        <label for="url-input">YouTube URLs</label>
+                        <textarea class="input-field" id="url-input"
+                            placeholder="Paste one or more YouTube URLs (one per line)&#10;&#10;Examples:&#10;https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://www.youtube.com/playlist?list=PLrAXtmEr..."></textarea>
+                    </div>
+
+                    <div class="inline-row">
+                        <div style="display:flex; gap:1rem;">
+                            <div class="input-group" style="flex:1">
+                                <label for="dl-type">Format</label>
+                                <select id="dl-type" class="input-field" onchange="handleTypeChange()">
+                                    <option value="audio">🎵 Audio (MP3)</option>
+                                    <option value="video">🎥 Video (MP4)</option>
+                                </select>
+                            </div>
+                            <div class="input-group" style="flex:1" id="quality-group">
+                                <label for="quality" id="quality-label">Audio Quality</label>
+                                <select id="quality" class="input-field">
+                                    <option value="128">128 kbps — Compact</option>
+                                    <option value="192" selected>192 kbps — Balanced</option>
+                                    <option value="320">320 kbps — High Quality</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="input-group">
+                            <label for="trim-start">Trim Start</label>
+                            <input type="text" class="input-field" id="trim-start"
+                                   placeholder="e.g. 00:30 or 1:05">
+                        </div>
+                        <div class="input-group">
+                            <label for="trim-end">Trim End</label>
+                            <input type="text" class="input-field" id="trim-end"
+                                   placeholder="e.g. 3:45 or 04:00">
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary btn-full" id="submit-btn">
+                        ⬇️ Download MP3
+                    </button>
+                </form>
+            </div>
+
+            <!-- Download Queue -->
+            <div class="card">
+                <div class="queue-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.25rem;">
+                    <h2 class="card-title" style="margin-bottom:0"><span class="icon">📥</span> Download Queue</h2>
+                    <div id="queue-actions">
+                        <!-- Global actions like Download All ZIP -->
+                    </div>
+                </div>
+                <div id="download-queue">
+                    <div class="queue-empty">
+                        <div class="empty-icon">📭</div>
+                        <p>No active downloads — paste a YouTube URL above to get started.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ Search Panel ═══ -->
+        <section class="tab-panel" id="panel-search" role="tabpanel">
+            <div class="card">
+                <h2 class="card-title"><span class="icon">🔍</span> Search YouTube</h2>
+                <div class="search-bar">
+                    <input type="text" class="input-field" id="search-input"
+                           placeholder="Search for songs, artists, videos...">
+                    <button class="btn btn-primary" id="search-btn">🔍 Search</button>
+                </div>
+            </div>
+
+            <div class="search-results" id="search-results">
+                <div style="grid-column: 1/-1; text-align:center; padding:3rem; color:var(--text-muted)">
+                    Type a search query above to find YouTube videos.
+                </div>
+            </div>
+        </section>
+
+        <!-- ═══ History Panel ═══ -->
+        <section class="tab-panel" id="panel-history" role="tabpanel">
+            <div class="card">
+                <div class="history-header">
+                    <h2 class="card-title" style="margin-bottom:0"><span class="icon">📋</span> Download History</h2>
+                    <div class="history-actions">
+                        <button class="btn btn-sm btn-secondary" onclick="clearHistory()">🗑️ Clear All</button>
+                    </div>
+                </div>
+                <div id="history-list">
+                    <div style="text-align:center; padding:2rem; color:var(--text-muted)">
+                        Switch to this tab to load your download history.
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
