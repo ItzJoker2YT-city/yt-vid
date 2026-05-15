@@ -1,0 +1,4 @@
+[2026-05-03 21:41:42,889] ERROR in engine: Download failed for https://youtu.be/4QoGAyQAzk8?si=ke6H-bzt_SmkRNWl: ERROR: Postprocessing: ffprobe and ffmpeg not found. Please install or provide the path using --ffmpeg-location
+[2026-05-03 22:12:04,013] ERROR in engine: Download failed for https://www.youtube.com/watch?v=hBGLzoQCCts: Download cancelled by user
+[2026-05-11 15:57:22,785] ERROR in engine: Download failed for https://www.youtube.com/watch?v=w0ohHcMCl78: 'NoneType' object has no attribute 'setdefault'
+[2026-05-14 03:29:34,456] ERROR in engine: Download failed for https://www.youtube.com/watch?v=_5xdTxsEjEA: 'NoneType' object has no attribute 'setdefault'
