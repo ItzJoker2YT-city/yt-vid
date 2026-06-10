@@ -1,0 +1,46 @@
+# ═════════════════════════════════════════════════════════════════════════════
+#  YT-MP3 Downloader — Docker Compose (Production)
+#
+#  1. Copy this file + Dockerfile + .env to your VPS
+#  2. Run: docker compose up -d
+#  3. Visit: http://your-vps-ip:5000
+#
+#  Optional: Put an Nginx or Cloudflare Tunnel in front of port 5000
+# ═════════════════════════════════════════════════════════════════════════════
+
+services:
+  yt-mp3:
+    build: .
+    image: yt-mp3:latest
+    container_name: yt-mp3
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5000}:5000"
+    environment:
+      # Production overrides (picked up by config.py)
+      - HOST=0.0.0.0
+      - PORT=${PORT:-5000}
+      - DEBUG=False
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DOWNLOAD_DIR=/music/YT-Downloads
+      - DEFAULT_QUALITY=${DEFAULT_QUALITY:-320}
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-3}
+      # If you have a domain behind a reverse proxy
+      - PROXY_FIX=${PROXY_FIX:-1}
+    volumes:
+      # Persist download history + Ghana cache across restarts
+      - yt-data:/app/data
+      # Downloads land here (access on host at /var/lib/yt-mp3/downloads)
+      - yt-downloads:/music/YT-Downloads
+    # Resource limits to prevent a runaway download from crashing the VPS
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 256M
+
+volumes:
+  yt-data:
+  yt-downloads:
