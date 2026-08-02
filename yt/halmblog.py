@@ -70,9 +70,63 @@ def _build_headers(ua: str) -> dict:
     }
 
 
+# Reader-proxy fallback for when halmblog.com's WAF blocks our server IP
+# entirely (e.g. Cloudflare flagging datacenter IPs). Most keyless proxies
+# (r.jina.ai, corsproxy.io, allorigins) are themselves Cloudflare-challenged
+# or need paid keys against this site, so the default fallback is a fresh
+# Wayback Machine "Save Page Now" capture — free, keyless, and archive.org's
+# crawler is not flagged by halmblog's WAF. Set HALMBLOG_READER_PROXIES to a
+# comma-separated list of reader-proxy prefixes (e.g. a keyed r.jina.ai) to
+# try those first; they must return raw HTML for the target URL at
+# <proxy><url>.
+_READER_PROXIES = [
+    p.strip() for p in os.environ.get("HALMBLOG_READER_PROXIES", "").split(",") if p.strip()
+]
+_WAYBACK_SAVE = "https://web.archive.org/save/"
+_WAYBACK_LATEST = "https://web.archive.org/web/2/"
+
+
+def _normalize_href(href: str) -> str:
+    """Strip Wayback Machine URL prefixes so cached links point at the real
+    site (snapshots rewrite links to web.archive.org/web/<ts>/<real-url>)."""
+    if not href:
+        return href
+    m = re.search(r"web\.archive\.org/web/\d+/", href)
+    if m:
+        return href[m.end():]
+    return href
+
+
+def _reader_proxy_fetch(proxy: str, url: str) -> str:
+    resp = _requests.get(
+        proxy + url,
+        headers={"User-Agent": _USER_AGENTS[0], "X-Return-Format": "html", "X-Timeout": "20"},
+        timeout=PAGE_TIMEOUT + 10,
+    )
+    if resp.status_code != 200 or "<" not in resp.text[:500]:
+        raise _requests.HTTPError(f"reader proxy returned {resp.status_code} for {url}")
+    return resp.text
+
+
+def _fetch_wayback(url: str, timeout: int = 90) -> str:
+    """Trigger a fresh Wayback Machine capture of url and return its HTML.
+    archive.org's crawler usually bypasses halmblog's WAF, so this keeps the
+    Ghana feed auto-updating even when the app's IP is blocked outright."""
+    headers = {"User-Agent": _USER_AGENTS[0]}
+    resp = _requests.get(_WAYBACK_SAVE + url, headers=headers, timeout=timeout, allow_redirects=True)
+    if resp.status_code not in (200, 201, 202):
+        raise _requests.HTTPError(f"Save Page Now returned {resp.status_code} for {url}")
+    snap = resp.url if "web.archive.org/web/" in resp.url else _WAYBACK_LATEST + url
+    r2 = _requests.get(snap, headers=headers, timeout=timeout)
+    if r2.status_code != 200 or "<" not in r2.text[:500]:
+        raise _requests.HTTPError(f"snapshot fetch returned {r2.status_code} for {url}")
+    return r2.text
+
+
 def _fetch_html(url: str, retries: int = 2) -> str:
     """Fetch raw HTML via requests, retrying with rotated User-Agents when the
     WAF blocks us (403/429/5xx or an undecodable compressed body).
+    If the site blocks our IP entirely, falls back to a reader proxy.
     Returns the page text; raises on final failure (callers handle it)."""
     last_err = None
     for attempt in range(retries + 1):
@@ -91,6 +145,26 @@ def _fetch_html(url: str, retries: int = 2) -> str:
             last_err = e
             logger.debug("Fetch attempt %d failed for %s: %s", attempt + 1, url, e)
             time.sleep(1.0 + attempt)   # gentle backoff between retries
+
+    # Direct fetching is blocked (WAF/IP) — try configured reader proxies,
+    # then a fresh Wayback Machine capture (listing pages only, to keep SPN's
+    # rate limits out of the MP3 filler's song-page crawl).
+    for proxy in _READER_PROXIES:
+        try:
+            text = _reader_proxy_fetch(proxy, url)
+            logger.info("Fetched %s via reader proxy %s", url, proxy)
+            return text
+        except _requests.RequestException as pe:
+            logger.warning("Reader proxy %s failed for %s: %s", proxy, url, pe)
+
+    if url.startswith(CATEGORY_URL):
+        try:
+            text = _fetch_wayback(url)
+            logger.info("Fetched %s via Wayback SPN (IP blocked)", url)
+            return text
+        except _requests.RequestException as pe:
+            logger.warning("Wayback SPN failed for %s: %s", url, pe)
+
     raise last_err
 
 
@@ -185,7 +259,7 @@ def scrape_listing(page: int = 1) -> list:
             continue
         raw_t = h2.get_text(strip=True)
         artist, title = _split_artist_title(raw_t)
-        link = a["href"]
+        link = _normalize_href(a["href"])
         if link and not link.startswith("http"):
             link = BASE_URL + link
 
@@ -267,6 +341,11 @@ def scrape_song_page(page_url: str) -> dict:
     img = entry.find("img")
     if img:
         thumb = img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")
+
+    if mp3_url:
+        mp3_url = _normalize_href(mp3_url)
+    if thumb:
+        thumb = _normalize_href(thumb)
 
     result = {
         "title": title or raw_t,
