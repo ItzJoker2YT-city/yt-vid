@@ -96,11 +96,17 @@ def _start_ghana_cache():
 
     # 3. Background MP3 filler (fills missing MP3s over time)
     def _mp3_filler():
+        from halmblog import mp3_filler_blocked
         while True:
             try:
                 time.sleep(120)   # every 2 minutes, fill 15 missing MP3s
                 fill_missing_mp3s(limit=15)
-                time.sleep(1800)  # then every 30 minutes
+                if mp3_filler_blocked():
+                    # WAF/IP block on song pages — stop hammering, let it cool down.
+                    app.logger.warning("Halmblog song pages blocked from this IP — MP3 filler paused for 1 hour")
+                    time.sleep(3600)
+                else:
+                    time.sleep(1800)  # then every 30 minutes
             except Exception as e:
                 app.logger.debug("MP3 filler error: %s", e)
     threading.Thread(target=_mp3_filler, daemon=True, name="ghana-mp3-filler").start()

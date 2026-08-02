@@ -32,6 +32,16 @@ _BACKGROUND_THREAD = None
 _song_page_cache = {}
 _PAGE_CACHE_TTL = 60
 
+# Consecutive song-page fetch failures — detects a WAF/IP block so the
+# background MP3 filler can back off instead of hammering a blocked endpoint.
+_mp3_fail_streak = 0
+_MP3_BLOCK_THRESHOLD = 6
+
+
+def mp3_filler_blocked() -> bool:
+    """True when recent song-page fetches have failed en masse (WAF/IP block)."""
+    return _mp3_fail_streak >= _MP3_BLOCK_THRESHOLD
+
 import requests as _requests
 
 
@@ -221,7 +231,7 @@ def scrape_song_page(page_url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
     except Exception as e:
         logger.warning("Failed to fetch song page %s: %s", page_url, e)
-        return {"title": "", "artist": "", "mp3_url": None, "thumbnail": "", "page_url": page_url}
+        return {"title": "", "artist": "", "mp3_url": None, "thumbnail": "", "page_url": page_url, "fetch_error": str(e)}
 
     h1 = soup.find("h1")
     raw_t = h1.get_text(strip=True) if h1 else ""
@@ -322,6 +332,7 @@ def build_cache(max_pages: int = 2) -> dict:
 def fill_missing_mp3s(limit: int = 50) -> int:
     """Background task: visit song pages without MP3 and extract links.
     Returns number of MP3s found."""
+    global _mp3_fail_streak
     cache = _load_cache()
     filled = 0
     pending = [s for s in cache.get("songs", []) if not s.get("mp3_url")][:limit]
@@ -329,19 +340,25 @@ def fill_missing_mp3s(limit: int = 50) -> int:
     for s in pending:
         try:
             details = scrape_song_page(s["page_url"])
-            if details.get("mp3_url"):
-                s["mp3_url"] = details["mp3_url"]
-                s["has_mp3"] = True
-                s["thumbnail"] = details.get("thumbnail") or s.get("thumbnail", "")
-                filled += 1
+            if details.get("fetch_error"):
+                _mp3_fail_streak += 1
+                logger.debug("Song page blocked: %s (streak %d)", s["page_url"], _mp3_fail_streak)
+            else:
+                _mp3_fail_streak = 0
+                if details.get("mp3_url"):
+                    s["mp3_url"] = details["mp3_url"]
+                    s["has_mp3"] = True
+                    s["thumbnail"] = details.get("thumbnail") or s.get("thumbnail", "")
+                    filled += 1
             time.sleep(0.8)   # be gentle — the WAF rate-limits aggressive crawlers
         except Exception as e:
+            _mp3_fail_streak += 1
             logger.debug("MP3 fill failed for %s: %s", s["page_url"], e)
 
     if filled > 0:
         with _CACHE_LOCK:
             _save_cache(cache)
-    logger.info("MP3 fill pass complete: %d/%d found", filled, len(pending))
+    logger.info("MP3 fill pass complete: %d/%d found (block streak %d)", filled, len(pending), _mp3_fail_streak)
     return filled
 
 
