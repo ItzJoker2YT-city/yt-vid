@@ -35,29 +35,53 @@ _PAGE_CACHE_TTL = 60
 import requests as _requests
 
 
-def _fetch_html(url: str) -> str:
-    """Fetch raw HTML via requests (reliable, no API credits needed)."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
+_USER_AGENTS = [
+    # Browser-like UAs, rotated on retries. Do NOT send an explicit
+    # Accept-Encoding (esp. br) or Sec-Fetch-* headers — halmblog.com's WAF
+    # answers that combo with 403s / undecodable compressed bodies. Requests
+    # handles gzip/deflate on its own.
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+]
+
+
+def _build_headers(ua: str) -> dict:
+    return {
+        "User-Agent": ua,
         "Accept": (
             "text/html,application/xhtml+xml,application/xml;q=0.9,"
             "image/avif,image/webp,*/*;q=0.8"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
+        "Referer": "https://www.halmblog.com/",
     }
-    session = _requests.Session()
-    resp = session.get(url, headers=headers, timeout=PAGE_TIMEOUT)
-    resp.raise_for_status()
-    return resp.text
+
+
+def _fetch_html(url: str, retries: int = 2) -> str:
+    """Fetch raw HTML via requests, retrying with rotated User-Agents when the
+    WAF blocks us (403/429/5xx or an undecodable compressed body).
+    Returns the page text; raises on final failure (callers handle it)."""
+    last_err = None
+    for attempt in range(retries + 1):
+        ua = _USER_AGENTS[attempt % len(_USER_AGENTS)]
+        session = _requests.Session()
+        try:
+            resp = session.get(url, headers=_build_headers(ua), timeout=PAGE_TIMEOUT)
+            if resp.status_code in (403, 429, 500, 502, 503, 504):
+                raise _requests.HTTPError(f"{resp.status_code} Client/Server Error for {url}")
+            resp.raise_for_status()
+            text = resp.text
+            if "<" not in text[:500]:
+                raise _requests.HTTPError(f"non-HTML body (undecoded compression?) for {url}")
+            return text
+        except _requests.RequestException as e:
+            last_err = e
+            logger.debug("Fetch attempt %d failed for %s: %s", attempt + 1, url, e)
+            time.sleep(1.0 + attempt)   # gentle backoff between retries
+    raise last_err
 
 
 # ─── Artist / Title Parser ───────────────────────────────────────────────────
@@ -310,6 +334,7 @@ def fill_missing_mp3s(limit: int = 50) -> int:
                 s["has_mp3"] = True
                 s["thumbnail"] = details.get("thumbnail") or s.get("thumbnail", "")
                 filled += 1
+            time.sleep(0.8)   # be gentle — the WAF rate-limits aggressive crawlers
         except Exception as e:
             logger.debug("MP3 fill failed for %s: %s", s["page_url"], e)
 
@@ -631,6 +656,7 @@ def build_deep_cache(max_pages: int = 100) -> dict:
     existing = _by_url(cache)
     all_songs = list(existing.values())
     new_cnt = 0
+    deepest = 0
 
     for p in range(1, max_pages + 1):
         listings = scrape_listing(page=p)
@@ -645,30 +671,38 @@ def build_deep_cache(max_pages: int = 100) -> dict:
                     "has_mp3": False,
                     "scraped_at": datetime.now().isoformat(),
                 })
+                existing[key] = True
                 new_cnt += 1
+        deepest = p
         time.sleep(0.25)
 
     cache["songs"] = all_songs
+    cache["max_page"] = deepest
     cache["last_updated"] = datetime.now().isoformat()
     with _CACHE_LOCK:
         _save_cache(cache)
-    logger.info("Deep cache: %d total songs (%d new)", len(all_songs), new_cnt)
+    logger.info("Deep cache: %d total songs (%d new, deepest page %d)", len(all_songs), new_cnt, deepest)
     return cache
 
 
 def resume_deep_cache(max_pages: int = 100) -> int:
-    """Continue deep cache from last known position."""
+    """Continue deep cache from the deepest page we already reached.
+    Progress is persisted as 'max_page' in the cache file, so repeated
+    clicks genuinely walk further into the archive (page 1 is kept fresh
+    by check_for_updates). Saves incrementally so long crawls aren't lost.
+    """
     cache = _load_cache()
     existing = _by_url(cache)
-    current = len(existing)
-    start_page = (current // 15) + 1
-    logger.info("Deep cache resume: %d songs, start page %d", current, start_page)
-
+    start_page = int(cache.get("max_page") or 1) + 1
     new_cnt = 0
+    deepest = start_page - 1
+    logger.info("Deep cache resume: %d songs, start page %d", len(existing), start_page)
+
     for p in range(start_page, max_pages + 1):
         listings = scrape_listing(page=p)
         if not listings:
             break
+        added_on_page = 0
         for item in listings:
             key = item["page_url"]
             if key not in existing:
@@ -678,12 +712,23 @@ def resume_deep_cache(max_pages: int = 100) -> int:
                     "has_mp3": False,
                     "scraped_at": datetime.now().isoformat(),
                 })
+                existing[key] = True
                 new_cnt += 1
+                added_on_page += 1
+        deepest = p
         time.sleep(0.35)
+        # Save progress incrementally so the live song count updates in the UI
+        # and a long crawl isn't lost if the server restarts.
+        if added_on_page > 0 or deepest == max_pages:
+            cache["max_page"] = deepest
+            cache["last_updated"] = datetime.now().isoformat()
+            with _CACHE_LOCK:
+                _save_cache(cache)
 
     if new_cnt > 0:
+        cache["max_page"] = deepest
         cache["last_updated"] = datetime.now().isoformat()
         with _CACHE_LOCK:
             _save_cache(cache)
-    logger.info("Deep cache resume: +%d (total %d)", new_cnt, len(cache["songs"]))
+    logger.info("Deep cache resume: +%d (total %d, deepest page %d)", new_cnt, len(cache["songs"]), deepest)
     return new_cnt

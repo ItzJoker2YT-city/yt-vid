@@ -1,70 +1,97 @@
 # 🎵 YT-MP3 — YouTube to MP3 Downloader
 
-A fast, multi-feature downloader for DJs and music lovers. Download YouTube audio and video, browse Ghanaian music from Halmblog.com, search by artist, and manage downloads with a clean web UI.
+A fast, self-hosted downloader for DJs and music lovers. Download YouTube audio (MP3, 128–320 kbps) and video (MP4, up to 1080p) from a clean web UI, plus a **live Ghana Music feed** scraped from Halmblog.com with auto-updates and an archive deep-cache.
 
----
-
-## Quick Start
-
-```bash
-pip install -r requirements.txt
-python app.py          # Open http://127.0.0.1:5000
+```
+✅ Works out of the box on a fresh VPS — no paid services, no API keys.
 ```
 
 ---
 
-## VPS Deployment
+## Requirements (VPS)
 
-### Option 1 — Docker Compose (RECOMMENDED)
+| Requirement | Why | Install |
+|---|---|---|
+| **ffmpeg** | MP3 conversion, trimming, merged video. **Without it, MP3 downloads fail** (`ffprobe and ffmpeg not found`) | `sudo apt install -y ffmpeg` |
+| Python **3.10+** (3.11+ recommended) | App runtime; yt-dlp warns on 3.10 | `sudo apt install -y python3-venv python3-pip` |
+| Nginx (optional) | Reverse proxy for HTTPS / domain | `sudo apt install -y nginx` |
+| ~1 GB RAM, ~2 GB disk | Downloads + cache | — |
+
+> 💡 Everything below already installs ffmpeg for you — it's only listed here so you know why it matters.
+
+---
+
+## Deploy on your VPS
+
+**First, get the code onto the VPS** — the app lives in the `yt/` folder of the repo:
 
 ```bash
-git clone <repo>
-cd yt-mp3
-cp .env.example .env
-nano .env              # Edit if needed
-
-sudo docker compose up -d --build
+git clone https://github.com/ItzJoker2YT-city/yt-vid.git
+cd yt-vid/yt        # ← the Flask app root
 ```
-Server runs on port `5000`. Add a reverse proxy (Nginx / Caddy / Cloudflare Tunnel) for HTTPS.
 
-### Option 2 — One-Command Installer (Bare Metal)
+You now have 3 options, all proven. **Option 1 is the quickest.**
+
+---
+
+### Option 1 — One-command installer (RECOMMENDED, bare metal)
+
+Works on Ubuntu 20.04+, Debian 11+, CentOS/AlmaLinux 8+. Installs ffmpeg + nginx + systemd service + firewall and health-checks the app:
 
 ```bash
-scp -r . root@your-vps-ip:/tmp/yt-mp3
-ssh root@your-vps-ip
-cd /tmp/yt-mp3
-chmod +x scripts/install.sh
+cd yt-vid/yt
 sudo ./scripts/install.sh
 ```
-Done! Nginx reverse proxy, systemd service, firewall, and auto-start all set up.
 
-### Option 3 — Manual Install
-
-On any Ubuntu/Debian VPS:
+That's it. After it finishes:
 
 ```bash
-# 1. Dependencies
-sudo apt update && sudo apt install -y python3-venv ffmpeg nginx git curl
+systemctl status yt-mp3           # running?
+journalctl -u yt-mp3 -f           # live logs
+curl http://your-vps-ip           # web UI (via nginx on port 80)
+```
 
-# 2. Create user + dirs
+What it sets up:
+- App at `/opt/yt-mp3` (running as the `yt-mp3` user, waitress WSGI server)
+- `.env` with production defaults (`HOST=0.0.0.0`, `PORT=5000`, `PROXY_FIX=1`, …)
+- systemd service `yt-mp3` with `Restart=always`
+- Nginx reverse proxy on port 80 → `127.0.0.1:5000`
+- UFW firewall (HTTP + SSH)
+- Downloads saved to `/music/YT-Downloads`
+
+---
+
+### Option 2 — Manual systemd setup
+
+If you prefer to do it by hand (or the installer's distro isn't yours):
+
+```bash
+# 1. Dependencies (ffmpeg is the important one)
+sudo apt update && sudo apt install -y python3-venv python3-pip ffmpeg nginx curl git
+
+# 2. User + directories
 sudo useradd -r -s /bin/false -d /opt/yt-mp3 yt-mp3
 sudo mkdir -p /opt/yt-mp3 /music/YT-Downloads
 sudo chown yt-mp3:yt-mp3 /opt/yt-mp3 /music/YT-Downloads
 
-# 3. Copy code
-sudo cp -r . /opt/yt-mp3/
+# 3. Copy the app (from the yt/ folder of your clone)
+cd yt-vid/yt
+sudo tar --exclude='.git' --exclude='data/app.log' -cf - . | sudo tar -C /opt/yt-mp3 -xf -
+sudo chown -R yt-mp3:yt-mp3 /opt/yt-mp3
 
-# 4. Python venv
+# 4. Python venv + deps
 sudo -u yt-mp3 python3 -m venv /opt/yt-mp3/venv
 sudo -u yt-mp3 /opt/yt-mp3/venv/bin/pip install -r /opt/yt-mp3/requirements.txt
 
-# 5. Environment
+# 5. Config
 sudo tee /opt/yt-mp3/.env > /dev/null <<'EOF'
 HOST=0.0.0.0
 PORT=5000
 DEBUG=False
 LOG_LEVEL=INFO
 DOWNLOAD_DIR=/music/YT-Downloads
+DEFAULT_QUALITY=320
+MAX_CONCURRENT=3
 PROXY_FIX=1
 EOF
 
@@ -82,6 +109,7 @@ WorkingDirectory=/opt/yt-mp3
 EnvironmentFile=/opt/yt-mp3/.env
 ExecStart=/opt/yt-mp3/venv/bin/waitress-serve --host=0.0.0.0 --port=5000 --threads=8 app:app
 Restart=always
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 
@@ -90,10 +118,9 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable yt-mp3
-sudo systemctl start yt-mp3
+sudo systemctl enable --now yt-mp3
 
-# 7. Nginx reverse proxy
+# 7. (Optional) Nginx on port 80
 sudo tee /etc/nginx/sites-available/yt-mp3 > /dev/null <<'EOF'
 server {
     listen 80;
@@ -113,60 +140,124 @@ sudo ln -sf /etc/nginx/sites-available/yt-mp3 /etc/nginx/sites-enabled/
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl restart nginx
 
-# 8. Firewall
-sudo ufw allow 'Nginx Full' 2>/dev/null || true
+# 8. (Optional) Firewall
+sudo ufw allow 'Nginx Full'
 sudo ufw allow OpenSSH
 sudo ufw --force enable
 ```
 
-### Add SSL with Certbot (Strongly Recommended)
+---
+
+### Option 3 — Docker Compose
+
+The repo ships a production `Dockerfile` (Python 3.11 + **ffmpeg** + waitress) and `docker-compose.yml` with persistent volumes:
 
 ```bash
-sudo apt install certbot python3-certbot-nginx
+cd yt-vid/yt
+sudo docker compose up -d --build
+```
+
+- Web UI: `http://your-vps-ip:5000` (change `PORT` in the shell env to use a different host port)
+- Downloads + cache persist across restarts in the `yt-downloads` / `yt-data` volumes
+- Optional Nginx/Cloudflare Tunnel in front of port 5000
+
+---
+
+### Add SSL (strongly recommended)
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d yourdomain.com
 ```
+
+Or skip nginx entirely and use a **Cloudflare Tunnel** pointing to `http://127.0.0.1:5000` — keep `PROXY_FIX=1` either way (the app already handles proxy headers).
 
 ---
 
 ## Environment Variables
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` on VPS |
-| `PORT` | `5000` | Port to listen on |
-| `DEBUG` | `False` | `True` = dev auto-reload |
-| `DOWNLOAD_DIR` | `~/Music/YT-Downloads` | Where MP3s get saved |
-| `DEFAULT_QUALITY` | `320` | Default audio kbps |
-| `MAX_CONCURRENT` | `3` | How many downloads at once |
+|---|---|---|
+| `HOST` | `127.0.0.1` | Bind address — use `0.0.0.0` on a VPS |
+| `PORT` | `5000` | Listen port |
+| `DEBUG` | `False` | `True` = Flask dev auto-reload (never in prod) |
+| `DOWNLOAD_DIR` | `~/Music/YT-Downloads` | Where finished MP3/MP4 files are saved |
+| `DEFAULT_QUALITY` | `320` | Default audio kbps (`128` / `192` / `320`) |
+| `MAX_CONCURRENT` | `3` | Max simultaneous downloads |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `PROXY_FIX` | `` | Set to `1` behind Nginx/Cloudflare |
+| `PROXY_FIX` | *(empty)* | Set to `1` when running behind Nginx/Cloudflare |
 
 ---
 
-## Features
+## 🇬🇭 How the Ghana Music feed works
 
-- ⬇️ **Download** — Paste YouTube URLs, pick MP3 (128–320kbps) or MP4 (480p–1080p)
-- 🔍 **Search** — Search YouTube, browse 120+ Ghana artists, find albums
-- 🇬🇭 **Ghana Music** — Live feed from Halmblog.com with auto-scraper
-- 📋 **History** — Track what you downloaded, re-download instantly
-- 🎙️ (REMOVED) ~~Identify~~ — Song recognition via AcoustID
+No setup needed — it's fully automatic:
+
+1. **On first start** the app scrapes the Halmblog.com Ghana Music listing in the background and builds a local cache (`data/ghana_music.json`). The repo ships a pre-built cache with ~2,000 songs, so the feed is populated **immediately** even before the first scrape finishes.
+2. **Auto-update (live)** — every ~30–60 s the app re-checks page 1 and pins any newly posted songs to the top of the feed (the "auto-updating live" dot).
+3. **Deep cache** — the **"➕ Load More Pages (Deep Cache)"** button crawls deeper into the archive in the background and grows the cache page-by-page (progress shown live, resume position persisted as `max_page`).
+4. **MP3 links** — a background filler visits song pages and attaches direct `.mp3` URLs over time; songs without a link yet still stream/download via the detail scrape.
+
+> 🛡️ The scraper is hardened for Halmblog.com's bot protection (browser-like headers, no `Accept-Encoding: br`, automatic retry fallback) — scraping works from cloud/VPS IPs just like it does locally.
+
+---
+
+## Updating
+
+```bash
+# Bare metal
+cd yt-vid/yt && git pull
+sudo rsync -a --exclude='data/' --exclude='venv/' --exclude='.env' ./ /opt/yt-mp3/
+sudo systemctl restart yt-mp3
+
+# Docker
+cd yt-vid/yt && git pull && sudo docker compose up -d --build
+```
+
+## Backup
+
+The only state worth backing up (everything else is reproducible):
+
+```bash
+/opt/yt-mp3/data/          # download history + Ghana cache
+/music/YT-Downloads/       # finished downloads
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `ERROR: Postprocessing: ffprobe and ffmpeg not found` | `sudo apt install -y ffmpeg`, then `sudo systemctl restart yt-mp3` |
+| App won't start / port busy | `sudo systemctl status yt-mp3` and `journalctl -u yt-mp3 -f`; change `PORT` in `.env` |
+| Ghana feed empty on a fresh install | It self-builds in ~1–2 min — hit **🔄 Refresh**. If it stays empty, the VPS can't reach `halmblog.com` (firewall/egress) |
+| Server not responding after install | `curl http://localhost:5000/api/settings` on the VPS; check `systemctl status yt-mp3` |
+| Downloads run out of disk | Point `DOWNLOAD_DIR` at a bigger volume |
 
 ---
 
 ## Project Structure
 
 ```
-yt-mp3/
+yt/
 ├── app.py               # Flask routes & API
 ├── config.py            # Settings (env vars)
 ├── engine.py            # Download engine (yt-dlp)
-├── halmblog.py          # Ghana music scraper
+├── halmblog.py          # Ghana Music scraper + cache
 ├── requirements.txt     # Python deps
-├── Dockerfile           # Docker image
+├── Dockerfile           # Production image (ffmpeg included)
 ├── docker-compose.yml   # Production compose
-├── .env.example         # Env template
-├── scripts/install.sh   # One-click VPS installer
+├── scripts/install.sh   # One-command VPS installer
 ├── static/              # CSS + JS
 ├── templates/           # HTML
-└── data/                # History + cache
+└── data/                # History + Ghana cache (persistent)
 ```
+
+## Features
+
+- ⬇️ **Download** — single URLs, batch, playlists; MP3 128–320 kbps or MP4 480p–1080p; trim start/end
+- 🔍 **Search** — YouTube search, artist/album lookup, Ghana artist browser
+- 🇬🇭 **Ghana Music** — auto-updating feed from Halmblog.com with super search and deep cache
+- 📥 **Queue** — pause/resume/cancel, download all as ZIP
+- 📋 **History** — persistent download history with re-download

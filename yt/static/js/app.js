@@ -1135,8 +1135,10 @@ function updateGhanaCacheStatus() {
 
 async function triggerDeepCache() {
     const btn = document.getElementById('ghana-deep-btn');
+    const statusEl = document.getElementById('ghana-cache-status');
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Building deep cache...'; }
     showToast('🔄 Deep cache building in background (up to 100 pages)...', 'info');
+    let lastCount = _totalGhanaSongs;
     try {
         await fetch('/api/ghana-music/deep-cache', {
             method: 'POST',
@@ -1144,6 +1146,38 @@ async function triggerDeepCache() {
             body: JSON.stringify({ max_pages: 100 })
         });
     } catch { /* start is enough */ }
+
+    // Watch the cache grow, then restore the button once it settles.
+    let stablePolls = 0;
+    const poll = async () => {
+        try {
+            const res = await fetch('/api/ghana-music/info');
+            const info = await res.json();
+            if (info && !info.error && info.total_songs !== undefined) {
+                const grew = info.total_songs > lastCount;
+                if (grew) _totalGhanaSongs = info.total_songs;
+                if (statusEl) {
+                    if (grew) {
+                        statusEl.innerHTML = `⏳ Building deep cache... <b>${info.total_songs}</b> songs so far`;
+                    } else if (stablePolls >= 2) {
+                        statusEl.innerHTML = `⏳ Building deep cache... <b>${info.total_songs}</b> songs cached`;
+                    }
+                }
+                stablePolls = grew ? 0 : stablePolls + 1;
+                lastCount = info.total_songs;
+                if (stablePolls >= 3) {   // no growth for ~18s → build finished
+                    _totalGhanaSongs = info.total_songs;
+                    if (statusEl) updateGhanaCacheStatus();
+                    if (btn) { btn.disabled = false; btn.textContent = '➕ Load More Pages (Deep Cache)'; }
+                    showToast('✅ Deep cache updated — refreshed your song list!', 'success');
+                    loadGhanaMusicPage(1);   // show any newly cached songs
+                    return;
+                }
+            }
+        } catch { /* ignore polling errors */ }
+        setTimeout(poll, 6000);
+    };
+    setTimeout(poll, 6000);
 }
 
 function renderGhanaMusic(songs) {
