@@ -325,6 +325,7 @@ def api_ghana_music_search():
                     "thumbnail": s.get("thumbnail", ""),
                     "date": s.get("date", ""),
                     "mp3_url": s.get("mp3_url"),
+                    "mp3_url_fallback": s.get("mp3_url_fallback"),
                     "has_mp3": bool(s.get("mp3_url")),
                 }
                 for s in page_results
@@ -373,6 +374,7 @@ def api_ghana_music_search_next():
                 "thumbnail": s.get("thumbnail", ""),
                 "date": s.get("date", ""),
                 "mp3_url": s.get("mp3_url"),
+                "mp3_url_fallback": s.get("mp3_url_fallback"),
                 "has_mp3": bool(s.get("mp3_url")),
             }
             for s in page_results
@@ -425,6 +427,7 @@ def api_ghana_music_download():
     """
     data = request.get_json(silent=True) or {}
     mp3_url = data.get("mp3_url", "").strip()
+    fallback_url = data.get("fallback_url", "").strip()
     title = data.get("title", "").strip()
     artist = data.get("artist", "").strip()
     thumbnail = data.get("thumbnail", "").strip()
@@ -437,7 +440,7 @@ def api_ghana_music_download():
     try:
         tasks = engine.start_direct_download(
             mp3_url, title=title, artist=artist, thumbnail=thumbnail,
-            output_dir=output_dir, quality=quality,
+            output_dir=output_dir, quality=quality, fallback_url=fallback_url,
         )
         if tasks and len(tasks) > 0:
             return jsonify({
@@ -449,6 +452,42 @@ def api_ghana_music_download():
     except Exception as e:
         app.logger.error("Ghana music direct download failed: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ghana-music/youtube-download", methods=["POST"])
+def api_ghana_music_youtube_download():
+    """Fallback downloader: when halmblog's direct MP3 can't be reached
+    (WAF IP block, or the page simply has no direct link), queue the song
+    from YouTube instead — reusing the app's normal yt-dlp MP3 pipeline.
+    Works from any IP and needs no scraping of the blocked site."""
+    data = request.get_json(silent=True) or {}
+    title = data.get("title", "").strip()
+    artist = data.get("artist", "").strip()
+    quality = data.get("quality", config.DEFAULT_QUALITY)
+    if not title and not artist:
+        return jsonify({"error": "No song info provided"}), 400
+
+    query = f"{artist} {title} official audio" if artist else f"{title} official audio"
+    try:
+        results = engine.search_youtube(query, max_results=6)
+    except Exception as e:
+        app.logger.error("YouTube fallback search failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+    if not results:
+        return jsonify({"error": f"Could not find '{query}' on YouTube"}), 404
+
+    best = next(
+        (r for r in results if artist and artist.lower() in (r.get("title") or "").lower()),
+        results[0],
+    )
+    tasks = engine.start_download(best["url"], quality=quality, dl_type="audio")
+    return jsonify({
+        "success": True,
+        "query": query,
+        "youtube_title": best.get("title"),
+        "tasks": [t.to_dict() for t in tasks],
+    })
 
 
 @app.route("/api/history")

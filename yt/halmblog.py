@@ -37,6 +37,16 @@ _PAGE_CACHE_TTL = 60
 _mp3_fail_streak = 0
 _MP3_BLOCK_THRESHOLD = 6
 
+# True when the most recent page fetch fell back to a Wayback Machine capture
+# (i.e. halmblog's WAF is blocking our IP) — used to slow the MP3 filler and
+# to expose wayback serving URLs as download fallbacks.
+_fetch_via_wayback = False
+_wayback_lock = threading.Lock()
+_last_wayback_ts = 0.0
+# Save Page Now is expensive for archive.org and rate-limited (429s when
+# hammered) — keep at least this many seconds between fresh captures.
+_WAYBACK_MIN_INTERVAL = 30.0
+
 
 def mp3_filler_blocked() -> bool:
     """True when recent song-page fetches have failed en masse (WAF/IP block)."""
@@ -88,10 +98,12 @@ _WAYBACK_LATEST = "https://web.archive.org/web/2/"
 
 def _normalize_href(href: str) -> str:
     """Strip Wayback Machine URL prefixes so cached links point at the real
-    site (snapshots rewrite links to web.archive.org/web/<ts>/<real-url>)."""
+    site. Snapshots rewrite links to web.archive.org/web/<ts><modifier>/<url>
+    where <modifier> is e.g. 'im_' (image), 'if_' (iframe), 'id_' or empty —
+    strip that whole prefix (including any modifier)."""
     if not href:
         return href
-    m = re.search(r"web\.archive\.org/web/\d+/", href)
+    m = re.search(r"web\.archive\.org/web/\d+(?:[a-z]{2}_)?/", href)
     if m:
         return href[m.end():]
     return href
@@ -108,11 +120,38 @@ def _reader_proxy_fetch(proxy: str, url: str) -> str:
     return resp.text
 
 
+def _throttle_wayback():
+    """Space out Save Page Now requests (archive.org rate-limits them).
+    Called before each SPN save; serialises only the throttle decision, not
+    the network call itself."""
+    global _last_wayback_ts
+    with _wayback_lock:
+        wait = _WAYBACK_MIN_INTERVAL - (time.time() - _last_wayback_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _last_wayback_ts = time.time()
+
+
 def _fetch_wayback(url: str, timeout: int = 90) -> str:
-    """Trigger a fresh Wayback Machine capture of url and return its HTML.
+    """Fetch url through the Wayback Machine. Tries the latest EXISTING
+    snapshot first (a cheap read, no load on archive.org), and only falls
+    back to a fresh Save Page Now capture for pages that have none.
     archive.org's crawler usually bypasses halmblog's WAF, so this keeps the
-    Ghana feed auto-updating even when the app's IP is blocked outright."""
+    Ghana feed + MP3 lookups working even when the app's IP is blocked."""
     headers = {"User-Agent": _USER_AGENTS[0]}
+
+    # 1) Latest existing snapshot (web/2/ = "most recent"). If no snapshot
+    # exists it redirects to the live site (which is blocked for us) and we
+    # fall through to SPN.
+    try:
+        r = _requests.get(_WAYBACK_LATEST + url, headers=headers, timeout=timeout, allow_redirects=True)
+        if "web.archive.org/web/" in r.url and r.status_code == 200 and "<" in r.text[:500]:
+            return r.text
+    except _requests.RequestException:
+        pass
+
+    # 2) Fresh capture via Save Page Now (throttled — expensive for archive.org)
+    _throttle_wayback()
     resp = _requests.get(_WAYBACK_SAVE + url, headers=headers, timeout=timeout, allow_redirects=True)
     if resp.status_code not in (200, 201, 202):
         raise _requests.HTTPError(f"Save Page Now returned {resp.status_code} for {url}")
@@ -121,6 +160,12 @@ def _fetch_wayback(url: str, timeout: int = 90) -> str:
     if r2.status_code != 200 or "<" not in r2.text[:500]:
         raise _requests.HTTPError(f"snapshot fetch returned {r2.status_code} for {url}")
     return r2.text
+
+
+def _set_via_wayback(value: bool):
+    """Record whether the latest successful fetch used a Wayback capture."""
+    global _fetch_via_wayback
+    _fetch_via_wayback = value
 
 
 def _fetch_html(url: str, retries: int = 2) -> str:
@@ -140,6 +185,7 @@ def _fetch_html(url: str, retries: int = 2) -> str:
             text = resp.text
             if "<" not in text[:500]:
                 raise _requests.HTTPError(f"non-HTML body (undecoded compression?) for {url}")
+            _set_via_wayback(False)
             return text
         except _requests.RequestException as e:
             last_err = e
@@ -147,19 +193,23 @@ def _fetch_html(url: str, retries: int = 2) -> str:
             time.sleep(1.0 + attempt)   # gentle backoff between retries
 
     # Direct fetching is blocked (WAF/IP) — try configured reader proxies,
-    # then a fresh Wayback Machine capture (listing pages only, to keep SPN's
-    # rate limits out of the MP3 filler's song-page crawl).
+    # then a fresh Wayback Machine capture. Both listing AND song pages use
+    # the fallback so the feed keeps updating and MP3 links stay findable
+    # from a blocked IP; the SPN throttle + filler pacing keep archive.org
+    # rate limits happy.
     for proxy in _READER_PROXIES:
         try:
             text = _reader_proxy_fetch(proxy, url)
+            _set_via_wayback(False)
             logger.info("Fetched %s via reader proxy %s", url, proxy)
             return text
         except _requests.RequestException as pe:
             logger.warning("Reader proxy %s failed for %s: %s", proxy, url, pe)
 
-    if url.startswith(CATEGORY_URL):
+    if "halmblog.com" in url:
         try:
             text = _fetch_wayback(url)
+            _set_via_wayback(True)
             logger.info("Fetched %s via Wayback SPN (IP blocked)", url)
             return text
         except _requests.RequestException as pe:
@@ -283,17 +333,13 @@ def scrape_listing(page: int = 1) -> list:
 
 
 # ─── Scrape Individual Song Page ─────────────────────────────────────────────
-def _extract_mp3(href: str) -> str | None:
-    if not href:
-        return None
-    href = href.strip()
-    if href.lower().startswith("http") and ".mp3" in href.lower():
-        return href
-    return None
-
-
 def scrape_song_page(page_url: str) -> dict:
-    """Scrape a halmblog song page for direct MP3 URL + metadata."""
+    """Scrape a halmblog song page for direct MP3 URL + metadata.
+
+    Returns mp3_url (normalised to the real www.halmblog.com URL) and
+    mp3_url_fallback — when the page was fetched via a Wayback snapshot, the
+    raw web.archive.org serving URL of the MP3, so downloads can retry
+    through archive.org when halmblog's WAF blocks our IP."""
     cache_key = page_url
     now = time.time()
     cached = _song_page_cache.get(cache_key)
@@ -305,52 +351,55 @@ def scrape_song_page(page_url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
     except Exception as e:
         logger.warning("Failed to fetch song page %s: %s", page_url, e)
-        return {"title": "", "artist": "", "mp3_url": None, "thumbnail": "", "page_url": page_url, "fetch_error": str(e)}
+        return {"title": "", "artist": "", "mp3_url": None, "mp3_url_fallback": None, "thumbnail": "", "page_url": page_url, "fetch_error": str(e)}
 
     h1 = soup.find("h1")
     raw_t = h1.get_text(strip=True) if h1 else ""
     artist, title = _split_artist_title(raw_t)
 
-    # <audio> tag -> direct src
+    # Gather every candidate MP3 href: <audio> src, anchors containing ".mp3"
+    # (halmblog puts the real file in a plain <a href="...mp3"> in the post
+    # body — no audio tag, no download-button class), then a regex over the
+    # raw HTML as a final net.
     mp3_url = None
+    mp3_url_fallback = None
+    candidates = []
     audio = soup.find("audio")
     if audio:
         src = audio.get("src") or ""
         src_tag = audio.find("source")
         if src_tag:
             src = src_tag.get("src") or src
-        mp3_url = _extract_mp3(src)
+        candidates.append(src)
+    candidates.extend(a["href"] for a in soup.find_all("a", href=True))
+    candidates.extend(re.findall(r'https?://[^\s"<>]+\.mp3[^\s"<>]*', html, re.IGNORECASE))
 
-    # <a> with .mp3
-    if not mp3_url:
-        for a in soup.find_all("a", href=True):
-            candidate = _extract_mp3(a["href"])
-            if candidate:
-                mp3_url = candidate
-                break
-
-    # regex
-    if not mp3_url:
-        mp3s = re.findall(r'https?://[^\s"<>]+\.mp3[^\s"<>]*', html, re.IGNORECASE)
-        if mp3s:
-            mp3_url = mp3s[0]
+    for cand in candidates:
+        raw = (cand or "").strip()
+        if ".mp3" not in raw.lower():
+            continue
+        normalized = _normalize_href(raw)
+        if not (normalized.lower().startswith("http://") or normalized.lower().startswith("https://")):
+            continue
+        mp3_url = normalized
+        if normalized != raw:
+            # Raw href is a Wayback serving URL (web.archive.org/web/<ts>im_/...)
+            # — keep it as a download fallback.
+            mp3_url_fallback = raw
+        break
 
     # thumbnail
     thumb = ""
     entry = soup.find("article") or soup.find("div", class_="entry-content") or soup
     img = entry.find("img")
     if img:
-        thumb = img.get("data-src") or img.get("data-lazy-src") or img.get("src", "")
-
-    if mp3_url:
-        mp3_url = _normalize_href(mp3_url)
-    if thumb:
-        thumb = _normalize_href(thumb)
+        thumb = _normalize_href(img.get("data-src") or img.get("data-lazy-src") or img.get("src", ""))
 
     result = {
         "title": title or raw_t,
         "artist": artist,
         "mp3_url": mp3_url,
+        "mp3_url_fallback": mp3_url_fallback,
         "thumbnail": thumb,
         "page_url": page_url,
     }
@@ -426,10 +475,13 @@ def fill_missing_mp3s(limit: int = 50) -> int:
                 _mp3_fail_streak = 0
                 if details.get("mp3_url"):
                     s["mp3_url"] = details["mp3_url"]
+                    s["mp3_url_fallback"] = details.get("mp3_url_fallback")
                     s["has_mp3"] = True
                     s["thumbnail"] = details.get("thumbnail") or s.get("thumbnail", "")
                     filled += 1
-            time.sleep(0.8)   # be gentle — the WAF rate-limits aggressive crawlers
+            # Be gentle — the WAF rate-limits aggressive crawlers, and when the
+            # site is IP-blocked (fetches going via Wayback SPN) pace much slower.
+            time.sleep(15.0 if _fetch_via_wayback else 0.8)
         except Exception as e:
             _mp3_fail_streak += 1
             logger.debug("MP3 fill failed for %s: %s", s["page_url"], e)
@@ -739,6 +791,7 @@ def get_ghana_songs_cached(page: int = 1, limit: int = _PER_PAGE, force_raw: boo
             "thumbnail": s.get("thumbnail", ""),
             "date": s.get("date", ""),
             "mp3_url": s.get("mp3_url"),
+            "mp3_url_fallback": s.get("mp3_url_fallback"),
             "has_mp3": bool(s.get("mp3_url")),
         }
         for s in page_songs

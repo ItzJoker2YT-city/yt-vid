@@ -79,6 +79,7 @@ class DownloadTask:
                  playlist_id=None, playlist_title=None, track_index=None, track_total=None, dl_type="audio"):
         self.id = str(uuid.uuid4())[:8]
         self.url = url
+        self.fallback_url = None   # secondary download source (e.g. Wayback URL)
         self.output_dir = output_dir
         self.quality = quality
         self.trim_start = trim_start
@@ -1029,10 +1030,51 @@ def _save_history_entry_direct(task, filepath):
         json.dump(history, f, indent=2, ensure_ascii=False)
 
 
+def _stream_mp3(task, resp, out_path):
+    """Stream an MP3 response to disk with progress tracking (shared by the
+    primary and fallback download attempts)."""
+    total = int(resp.headers.get("content-length", 0))
+    if total:
+        task.filesize = _format_bytes(total)
+
+    downloaded = 0
+    start_time = _time.time()
+    chunk_size = 131072  # 128 KiB
+
+    with open(out_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if task._cancel_event.is_set():
+                raise Exception("Cancelled by user")
+
+            # Respect pause
+            task._pause_event.wait()
+
+            if not chunk:
+                continue
+
+            f.write(chunk)
+            downloaded += len(chunk)
+
+            if total > 0:
+                task.progress = (downloaded / total) * 100
+
+            elapsed = _time.time() - start_time
+            if elapsed > 0:
+                speed = downloaded / elapsed
+                task.speed = f"{_format_bytes(int(speed))}/s"
+
+                if total > 0 and speed > 0:
+                    remaining = (total - downloaded) / speed
+                    task.eta = _format_seconds(int(remaining))
+
+
 def _run_direct_download(task):
     """
     Download a direct MP3 URL via HTTP streaming with progress tracking.
     Integrates with the same task model the rest of the app uses.
+    If the primary URL is WAF-blocked (403 etc.) and the task has a
+    fallback_url (a Wayback serving URL captured with the page), retries
+    from there so downloads still work from an IP-blocked server.
     """
     try:
         out_dir = task.output_dir
@@ -1061,41 +1103,22 @@ def _run_direct_download(task):
         task.status = "downloading"
         task.progress = 0.0
 
-        with _requests.get(task.url, headers=headers, stream=True, timeout=30) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            if total:
-                task.filesize = _format_bytes(total)
-
-            downloaded = 0
-            start_time = _time.time()
-            chunk_size = 131072  # 128 KiB
-
-            with open(out_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=chunk_size):
-                    if task._cancel_event.is_set():
-                        raise Exception("Cancelled by user")
-
-                    # Respect pause
-                    task._pause_event.wait()
-
-                    if not chunk:
-                        continue
-
-                    f.write(chunk)
-                    downloaded += len(chunk)
-
-                    if total > 0:
-                        task.progress = (downloaded / total) * 100
-
-                    elapsed = _time.time() - start_time
-                    if elapsed > 0:
-                        speed = downloaded / elapsed
-                        task.speed = f"{_format_bytes(int(speed))}/s"
-
-                        if total > 0 and speed > 0:
-                            remaining = (total - downloaded) / speed
-                            task.eta = _format_seconds(int(remaining))
+        source_url = task.url
+        fallback_url = getattr(task, "fallback_url", None)
+        try:
+            with _requests.get(source_url, headers=headers, stream=True, timeout=30) as resp:
+                resp.raise_for_status()
+                _stream_mp3(task, resp, out_path)
+        except _requests.HTTPError:
+            if not fallback_url:
+                raise
+            logger.warning(
+                "Direct MP3 blocked (%s) — retrying via Wayback fallback %s",
+                source_url, fallback_url,
+            )
+            with _requests.get(fallback_url, headers=headers, stream=True, timeout=90) as resp:
+                resp.raise_for_status()
+                _stream_mp3(task, resp, out_path)
 
         # Embed metadata into the downloaded MP3
         try:
@@ -1139,9 +1162,11 @@ def _format_seconds(secs):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def start_direct_download(url, title="", artist="", thumbnail="", output_dir=None, quality="320"):
+def start_direct_download(url, title="", artist="", thumbnail="", output_dir=None, quality="320", fallback_url=""):
     """
     Queue a direct MP3 HTTP download so it appears in the queue UI with progress.
+    fallback_url: optional Wayback serving URL used if the primary URL is
+    WAF-blocked (e.g. halmblog.com blocking a datacenter IP).
     Returns the DownloadTask ( wrapped in a list, like start_download ).
     """
     output_dir = output_dir or config.DEFAULT_DOWNLOAD_DIR
@@ -1149,6 +1174,7 @@ def start_direct_download(url, title="", artist="", thumbnail="", output_dir=Non
     task.title = title or url.split("/")[-1].rsplit(".", 1)[0].replace("-", " ").replace("_", " ")
     task.artist = artist
     task.thumbnail = thumbnail
+    task.fallback_url = fallback_url or None
 
     with download_lock:
         active_downloads[task.id] = task

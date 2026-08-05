@@ -1212,7 +1212,8 @@ function renderGhanaMusic(songs) {
                         ? `<button class="btn btn-sm btn-primary" onclick="downloadGhanaSong('${escapeHtml(s.mp3_url)}',
                             '${escapeHtml(s.title)}',
                             '${escapeHtml(s.artist || '')}',
-                            '${escapeHtml(s.thumbnail)}', this)">⬇️ Download</button>`
+                            '${escapeHtml(s.thumbnail)}',
+                            '${escapeHtml(s.mp3_url_fallback || '')}', this)">⬇️ Download</button>`
                         : `<button class="btn btn-sm btn-primary" onclick="fetchGhanaMp3('${escapeHtml(s.page_url)}',
                             '${escapeHtml(s.title)}',
                             '${escapeHtml(s.artist || '')}',
@@ -1220,6 +1221,7 @@ function renderGhanaMusic(songs) {
                             🔍 Fetch MP3
                            </button>`
                     }
+                    <button class="btn btn-sm btn-secondary" title="Download this song from YouTube (works even when halmblog blocks direct MP3s)" onclick="downloadGhanaViaYouTube('${escapeHtml(s.title)}', '${escapeHtml(s.artist || '')}', this)">🎬 YouTube MP3</button>
                     <button class="btn btn-sm btn-secondary" onclick="window.open('${escapeHtml(s.page_url)}','_blank')">👁️ View</button>
                 </div>
             </div>
@@ -1293,7 +1295,7 @@ function updateGhanaSelectCount() {
     if (btn) btn.disabled = count === 0;
 }
 
-async function downloadGhanaSong(mp3Url, title, artist, thumbnail, btnEl) {
+async function downloadGhanaSong(mp3Url, title, artist, thumbnail, fallbackUrl, btnEl) {
     if (!mp3Url) return;
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Queuing...'; }
 
@@ -1301,7 +1303,7 @@ async function downloadGhanaSong(mp3Url, title, artist, thumbnail, btnEl) {
         const res = await fetch('/api/ghana-music/download', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mp3_url: mp3Url, title, artist, thumbnail, quality: '320', dl_type: 'audio' })
+            body: JSON.stringify({ mp3_url: mp3Url, fallback_url: fallbackUrl || '', title, artist, thumbnail, quality: '320', dl_type: 'audio' })
         });
         const data = await res.json();
         if (data.error) {
@@ -1319,6 +1321,30 @@ async function downloadGhanaSong(mp3Url, title, artist, thumbnail, btnEl) {
     }
 }
 
+async function downloadGhanaViaYouTube(title, artist, btnEl) {
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Searching YouTube...'; }
+    try {
+        const res = await fetch('/api/ghana-music/youtube-download', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: title || '', artist: artist || '' })
+        });
+        const data = await res.json();
+        if (data.error) {
+            showToast(data.error, 'error');
+            if (btnEl) { btnEl.disabled = false; btnEl.textContent = '🎬 YouTube MP3'; }
+            return;
+        }
+        showToast(`🎬 Queued "${data.youtube_title || (artist + ' ' + title)}" from YouTube (320kbps)!`, 'success');
+        if (btnEl) { btnEl.textContent = '✅ Queued'; }
+        loadHistoryIds();
+        setTimeout(() => switchTab('download'), 800);
+    } catch {
+        showToast('Network error — is the server running?', 'error');
+        if (btnEl) { btnEl.disabled = false; btnEl.textContent = '🎬 YouTube MP3'; }
+    }
+}
+
 async function fetchGhanaMp3(pageUrl, title, artist, thumbnail, btnEl) {
     if (!pageUrl) return;
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Fetching...'; }
@@ -1330,23 +1356,25 @@ async function fetchGhanaMp3(pageUrl, title, artist, thumbnail, btnEl) {
             body: JSON.stringify({ url: pageUrl })
         });
         const data = await res.json();
-        if (data.error) {
-            showToast(data.error, 'error');
-            if (btnEl) { btnEl.disabled = false; btnEl.textContent = '🔍 Fetch MP3'; }
-            return;
-        }
-        if (!data.mp3_url) {
-            showToast('No MP3 link found on this page. Try visiting the page manually.', 'error');
-            if (btnEl) { btnEl.disabled = false; btnEl.textContent = '🔍 Fetch MP3'; }
+        if (data.error || data.fetch_error || !data.mp3_url) {
+            // Direct link unavailable (WAF IP block or the page has none) —
+            // fall back to downloading the song from YouTube instead.
+            showToast(data.fetch_error
+                ? 'Direct MP3 blocked by halmblog — falling back to YouTube...'
+                : 'No direct MP3 link — falling back to YouTube...', 'info');
+            downloadGhanaViaYouTube(title, artist, btnEl);
             return;
         }
         // Update the song in _ghanaSongs so future renders show the Download button
         const song = _ghanaSongs.find(s => s.page_url === pageUrl);
-        if (song) song.mp3_url = data.mp3_url;
+        if (song) {
+            song.mp3_url = data.mp3_url;
+            song.mp3_url_fallback = data.mp3_url_fallback || song.mp3_url_fallback || '';
+        }
         // Re-render with the new MP3
         renderGhanaMusic(_ghanaSongs);
         // Auto-download
-        downloadGhanaSong(data.mp3_url, data.title || title, data.artist || artist, data.thumbnail || thumbnail, null);
+        downloadGhanaSong(data.mp3_url, data.title || title, data.artist || artist, data.thumbnail || thumbnail, data.mp3_url_fallback || '', null);
         showToast('MP3 found! Queuing download...', 'success');
     } catch (e) {
         showToast('Failed to fetch MP3 link', 'error');
@@ -1370,6 +1398,7 @@ async function _batchFetchMp3s(songsToFetch, maxConc = 4) {
                 const data = await res.json();
                 if (data.mp3_url) {
                     song.mp3_url = data.mp3_url;
+                    song.mp3_url_fallback = data.mp3_url_fallback || song.mp3_url_fallback || '';
                     song.title = data.title || song.title;
                     song.artist = data.artist || song.artist;
                     song.thumbnail = data.thumbnail || song.thumbnail;
@@ -1407,8 +1436,36 @@ async function downloadSelectedGhana() {
         renderGhanaMusic(_ghanaSongs); // update UI with new MP3s
     }
 
-    if (songsWithMp3.length === 0) {
-        showToast('No direct MP3 links found for selected songs.', 'error');
+    let okCount = 0;
+    let ytCount = 0;
+    for (const song of songsWithMp3) {
+        try {
+            const res = await fetch('/api/ghana-music/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mp3_url: song.mp3_url, fallback_url: song.mp3_url_fallback || '', title: song.title, artist: song.artist || '', thumbnail: song.thumbnail, quality: '320', dl_type: 'audio' })
+            });
+            const data = await res.json();
+            if (!data.error) { okCount++; }
+        } catch { /* ignore individual failures in batch */ }
+    }
+
+    // Songs that still have no direct MP3 → queue them from YouTube instead
+    for (const song of songsMissingMp3) {
+        if (song.mp3_url) continue;   // filled by the batch fetch above
+        try {
+            const res = await fetch('/api/ghana-music/youtube-download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: song.title || '', artist: song.artist || '' })
+            });
+            const data = await res.json();
+            if (!data.error) { ytCount++; }
+        } catch { /* ignore individual failures in batch */ }
+    }
+
+    if (okCount === 0 && ytCount === 0) {
+        showToast('No downloadable source found for the selected songs.', 'error');
         if (btn) {
             btn.disabled = _ghanaSelected.size === 0;
             btn.innerHTML = `⬇️ Download Selected (<span id="ghana-selected-count">${_ghanaSelected.size}</span>)`;
@@ -1416,20 +1473,7 @@ async function downloadSelectedGhana() {
         return;
     }
 
-    let okCount = 0;
-    for (const song of songsWithMp3) {
-        try {
-            const res = await fetch('/api/ghana-music/download', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mp3_url: song.mp3_url, title: song.title, artist: song.artist || '', thumbnail: song.thumbnail, quality: '320', dl_type: 'audio' })
-            });
-            const data = await res.json();
-            if (!data.error) { okCount++; }
-        } catch { /* ignore individual failures in batch */ }
-    }
-
-    showToast(`✅ Queued ${okCount}/${songsWithMp3.length} song${okCount !== 1 ? 's' : ''} from Halmblog!`, 'success');
+    showToast(`✅ Queued ${okCount} direct + ${ytCount} YouTube fallback download${okCount + ytCount !== 1 ? 's' : ''}!`, 'success');
     _ghanaSelected.clear();
     updateGhanaSelectCount();
     renderGhanaMusic(_ghanaSongs);
