@@ -2,7 +2,7 @@
 Halmblog.com Ghana Music scraper — powered by requests + BeautifulSoup.
 Extracts song listings and direct MP3 file URLs.
 
-Uses a persistent JSON cache so repeat loads are instant.
+Uses a persistent SQLite cache (see cache_db.py) so repeat loads are instant.
 New songs are detected by scraping page 1 periodically.
 """
 import os
@@ -15,6 +15,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 import config
+import cache_db
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,6 @@ CATEGORY_URL = "https://www.halmblog.com/category/listen/ghana-music/"
 BASE_URL = "https://www.halmblog.com"
 PAGE_TIMEOUT = 20
 
-_CACHE_FILE = os.path.join(os.path.dirname(config.LOG_FILE), "ghana_music.json")
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL_SECONDS = 1800          # how often we auto-refresh page 1
 _BACKGROUND_THREAD = None
@@ -46,6 +46,19 @@ _last_wayback_ts = 0.0
 # Save Page Now is expensive for archive.org and rate-limited (429s when
 # hammered) — keep at least this many seconds between fresh captures.
 _WAYBACK_MIN_INTERVAL = 30.0
+# If the newest Wayback snapshot of a page is older than this, request a
+# fresh Save Page Now capture instead of serving the stale copy (used for the
+# live page-1 feed so new songs are actually picked up).
+_WAYBACK_STALE_SECONDS = 6 * 3600
+
+# Guard so only one deep-cache crawl runs at a time — the manual "Load More
+# Pages" button and the background auto-crawler share the same worker.
+_DEEP_CACHE_LOCK = threading.Lock()
+# Halmblog's archive has gaps (e.g. page 151 404s while 152 has songs), and
+# Wayback coverage of deep pages is sparse (largest known hole is ~149 pages).
+# The crawl skips empty pages cheaply but stops after this many in a row —
+# past the last covered page that signals the reachable end of the archive.
+_DEEP_EMPTY_STOP = 150
 
 
 def mp3_filler_blocked() -> bool:
@@ -81,17 +94,14 @@ def _build_headers(ua: str) -> dict:
 
 
 # Reader-proxy fallback for when halmblog.com's WAF blocks our server IP
-# entirely (e.g. Cloudflare flagging datacenter IPs). Most keyless proxies
-# (r.jina.ai, corsproxy.io, allorigins) are themselves Cloudflare-challenged
-# or need paid keys against this site, so the default fallback is a fresh
-# Wayback Machine "Save Page Now" capture — free, keyless, and archive.org's
-# crawler is not flagged by halmblog's WAF. Set HALMBLOG_READER_PROXIES to a
-# comma-separated list of reader-proxy prefixes (e.g. a keyed r.jina.ai) to
-# try those first; they must return raw HTML for the target URL at
-# <proxy><url>.
+# entirely (e.g. Cloudflare flagging datacenter IPs). r.jina.ai's reader mode
+# is keyless and successfully renders these pages (as markdown), so it's the
+# default; extra proxies can be added via HALMBLOG_READER_PROXIES (comma-
+# separated prefixes) and are tried before it. Prefixes must serve the target
+# URL at <proxy><url>. Wayback SPN is the last resort.
 _READER_PROXIES = [
     p.strip() for p in os.environ.get("HALMBLOG_READER_PROXIES", "").split(",") if p.strip()
-]
+] or ["https://r.jina.ai/"]
 _WAYBACK_SAVE = "https://web.archive.org/save/"
 _WAYBACK_LATEST = "https://web.archive.org/web/2/"
 
@@ -112,12 +122,30 @@ def _normalize_href(href: str) -> str:
 def _reader_proxy_fetch(proxy: str, url: str) -> str:
     resp = _requests.get(
         proxy + url,
-        headers={"User-Agent": _USER_AGENTS[0], "X-Return-Format": "html", "X-Timeout": "20"},
+        # r.jina.ai answers browser User-Agents (and X-Return-Format: html)
+        # with 403 on its keyless tier — send a bare UA, no X-Return-Format.
+        # Its default reader mode returns markdown, which the scrapers parse.
+        headers={"User-Agent": "Mozilla/5.0", "X-Timeout": "20"},
         timeout=PAGE_TIMEOUT + 10,
     )
-    if resp.status_code != 200 or "<" not in resp.text[:500]:
+    head = resp.text[:500]
+    # Accept either real HTML ("<") or r.jina.ai's markdown ("Title:" header).
+    if resp.status_code != 200 or ("<" not in head and "Title:" not in head):
         raise _requests.HTTPError(f"reader proxy returned {resp.status_code} for {url}")
     return resp.text
+
+
+def _wayback_timestamp(url: str):
+    """Extract the snapshot capture time from a Wayback URL like
+    https://web.archive.org/web/20260805041930/<target> — returns a unix
+    timestamp, or None when the URL isn't a dated snapshot."""
+    m = re.search(r"web\.archive\.org/web/(\d{14})", url)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d%H%M%S").timestamp()
+    except ValueError:
+        return None
 
 
 def _throttle_wayback():
@@ -132,34 +160,55 @@ def _throttle_wayback():
         _last_wayback_ts = time.time()
 
 
-def _fetch_wayback(url: str, timeout: int = 90) -> str:
+def _fetch_wayback(url: str, timeout: int = 90, prefer_fresh: bool = False, allow_spn: bool = True) -> str:
     """Fetch url through the Wayback Machine. Tries the latest EXISTING
-    snapshot first (a cheap read, no load on archive.org), and only falls
-    back to a fresh Save Page Now capture for pages that have none.
+    snapshot first (a cheap read, no load on archive.org). When prefer_fresh
+    is set (live listing pages) and that snapshot is stale, a fresh Save Page
+    Now capture is requested; if the capture is rate-limited we fall back to
+    the stale snapshot rather than failing. allow_spn controls whether a Save
+    Page Now capture is attempted at all — deep archive pages pass False so
+    the crawl doesn't hammer archive.org's rate-limited SPN endpoint.
     archive.org's crawler usually bypasses halmblog's WAF, so this keeps the
     Ghana feed + MP3 lookups working even when the app's IP is blocked."""
     headers = {"User-Agent": _USER_AGENTS[0]}
+    latest_text = None
 
     # 1) Latest existing snapshot (web/2/ = "most recent"). If no snapshot
     # exists it redirects to the live site (which is blocked for us) and we
-    # fall through to SPN.
+    # fall through to SPN (when allowed).
     try:
         r = _requests.get(_WAYBACK_LATEST + url, headers=headers, timeout=timeout, allow_redirects=True)
         if "web.archive.org/web/" in r.url and r.status_code == 200 and "<" in r.text[:500]:
-            return r.text
+            latest_text = r.text
+            snap_ts = _wayback_timestamp(r.url)
+            stale = snap_ts is None or (time.time() - snap_ts) > _WAYBACK_STALE_SECONDS
+            if not prefer_fresh or not stale:
+                return latest_text
     except _requests.RequestException:
         pass
 
-    # 2) Fresh capture via Save Page Now (throttled — expensive for archive.org)
-    _throttle_wayback()
-    resp = _requests.get(_WAYBACK_SAVE + url, headers=headers, timeout=timeout, allow_redirects=True)
-    if resp.status_code not in (200, 201, 202):
-        raise _requests.HTTPError(f"Save Page Now returned {resp.status_code} for {url}")
-    snap = resp.url if "web.archive.org/web/" in resp.url else _WAYBACK_LATEST + url
-    r2 = _requests.get(snap, headers=headers, timeout=timeout)
-    if r2.status_code != 200 or "<" not in r2.text[:500]:
-        raise _requests.HTTPError(f"snapshot fetch returned {r2.status_code} for {url}")
-    return r2.text
+    # 2) Fresh capture via Save Page Now (throttled — expensive for archive.org).
+    # Deep archive pages opt out so we don't exhaust archive.org's rate limits
+    # crawling pages that have no snapshot yet.
+    if not allow_spn:
+        if latest_text:
+            return latest_text
+        raise _requests.HTTPError(f"no Wayback snapshot for {url} (SPN disabled)")
+    try:
+        _throttle_wayback()
+        resp = _requests.get(_WAYBACK_SAVE + url, headers=headers, timeout=timeout, allow_redirects=True)
+        if resp.status_code not in (200, 201, 202):
+            raise _requests.HTTPError(f"Save Page Now returned {resp.status_code} for {url}")
+        snap = resp.url if "web.archive.org/web/" in resp.url else _WAYBACK_LATEST + url
+        r2 = _requests.get(snap, headers=headers, timeout=timeout)
+        if r2.status_code != 200 or "<" not in r2.text[:500]:
+            raise _requests.HTTPError(f"snapshot fetch returned {r2.status_code} for {url}")
+        return r2.text
+    except _requests.RequestException:
+        if latest_text:
+            logger.warning("Wayback SPN failed for %s — serving stale snapshot instead", url)
+            return latest_text
+        raise
 
 
 def _set_via_wayback(value: bool):
@@ -168,10 +217,13 @@ def _set_via_wayback(value: bool):
     _fetch_via_wayback = value
 
 
-def _fetch_html(url: str, retries: int = 2) -> str:
+def _fetch_html(url: str, retries: int = 2, prefer_fresh: bool = False, allow_spn: bool = True) -> str:
     """Fetch raw HTML via requests, retrying with rotated User-Agents when the
     WAF blocks us (403/429/5xx or an undecodable compressed body).
     If the site blocks our IP entirely, falls back to a reader proxy.
+    prefer_fresh is forwarded to the Wayback fallback so live listing pages
+    get a new capture instead of a stale snapshot; allow_spn is forwarded so
+    deep archive pages skip the rate-limited Save Page Now endpoint.
     Returns the page text; raises on final failure (callers handle it)."""
     last_err = None
     for attempt in range(retries + 1):
@@ -208,7 +260,7 @@ def _fetch_html(url: str, retries: int = 2) -> str:
 
     if "halmblog.com" in url:
         try:
-            text = _fetch_wayback(url)
+            text = _fetch_wayback(url, prefer_fresh=prefer_fresh, allow_spn=allow_spn)
             _set_via_wayback(True)
             logger.info("Fetched %s via Wayback SPN (IP blocked)", url)
             return text
@@ -225,45 +277,50 @@ def _split_artist_title(raw: str) -> tuple:
       'Donzy – Blackstars' -> ('Donzy', 'Blackstars')
       'Young Legend – Let Me Go' -> ('Young Legend', 'Let Me Go')
       'Nervous by Shatta Wale' -> ('Shatta Wale', 'Nervous')
+      'Wicked One by Ha-Di' -> ('Ha-Di', 'Wicked One')
     Falls back to ('', raw) if no separator found.
     """
     s = raw.strip()
     if not s:
         return ("", "")
 
-    for sep in ["\u2009", "\u00a0", " – ", " — ", " - ", "–", "—", "-"]:
+    # Spaced separators ("Artist – Title") first — unambiguous.
+    for sep in ["\u2009", "\u00a0", " – ", " — ", " - "]:
         if sep in s:
             parts = s.split(sep, 1)
             artist = parts[0].strip()
             title  = parts[1].strip()
             return (artist, title)
 
-    # "by" pattern
-    m = re.search(r'\bby\s+(.+)$', s, re.IGNORECASE)
+    # "Title by Artist" — use the LAST "by" so hyphens in names (e.g. "Ha-Di")
+    # aren't misread as separators, and "Stand By Me by Yaw" parses correctly.
+    m = list(re.finditer(r'\bby\s+', s, re.IGNORECASE))
     if m:
-        return (m.group(1).strip(), s[:m.start()].strip())
+        last = m[-1]
+        return (s[last.end():].strip(), s[:last.start()].strip())
+
+    # Bare separators last — risky with hyphens in artist names ("Ha-Di"),
+    # only used when nothing else matched.
+    for sep in ["–", "—", "-"]:
+        if sep in s:
+            parts = s.split(sep, 1)
+            artist = parts[0].strip()
+            title  = parts[1].strip()
+            return (artist, title)
 
     return ("", s)
 
 
 # ─── Persistent Cache Helpers ─────────────────────────────────────────────────
 def _load_cache() -> dict:
-    if not os.path.exists(_CACHE_FILE):
-        return {"last_updated": None, "songs": []}
-    try:
-        with open(_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {"last_updated": None, "songs": []}
+    return cache_db.load_cache()
 
 
 def _save_cache(data: dict):
     try:
-        os.makedirs(os.path.dirname(_CACHE_FILE), exist_ok=True)
-        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except IOError:
-        pass
+        cache_db.save_cache(data)
+    except Exception as e:
+        logger.warning("Failed to save cache to SQLite: %s", e)
 
 
 def _by_url(cache: dict) -> dict:
@@ -294,7 +351,10 @@ def scrape_listing(page: int = 1) -> list:
     """
     url = CATEGORY_URL if page == 1 else f"{CATEGORY_URL}page/{page}/"
     try:
-        html = _fetch_html(url)
+        # Page 1 is the live feed — ask for a fresh capture when stale. Deep
+        # pages (page > 1) only use existing Wayback snapshots; no SPN, so the
+        # deep crawl doesn't exhaust archive.org's rate limit.
+        html = _fetch_html(url, prefer_fresh=(page == 1), allow_spn=(page == 1))
     except Exception:
         return []
 
@@ -328,11 +388,69 @@ def scrape_listing(page: int = 1) -> list:
             "page_slug": link.rstrip("/").split("/")[-1] if link else "",
         })
 
+    # Reader proxies (r.jina.ai) return the page as markdown, not HTML — no
+    # <article>/<h2> tags. Fall back to parsing its [title](url) song links.
+    if not results:
+        results = _parse_markdown_listing(html)
+
     logger.info("Halmblog listing page %d -> %d songs", page, len(results))
     return results
 
 
+def _parse_markdown_listing(html: str) -> list:
+    """Parse a listing page rendered as markdown by r.jina.ai's reader mode.
+    Songs appear as '## [Title](https://www.halmblog.com/listen/<slug>/ "Title")'
+    with a '[![alt](thumb)](listen_url)' image link to pair a thumbnail with."""
+    results = []
+    seen = set()
+    # Pair thumbnails with their listen URL:
+    #   [![alt](img_url)](listen_url "Title")
+    thumb_by_listen = {}
+    for img_url, listen_url in re.findall(
+        r"\[!\[[^\]]*\]\((https?://[^\s)\"]+)\)\]\((https?://[^\s)\"]+)(?:\s+\"[^\"]*\")?\)",
+        html,
+    ):
+        listen_url = _normalize_href(listen_url)
+        if listen_url.startswith(BASE_URL + "/listen/"):
+            thumb_by_listen.setdefault(listen_url, _normalize_href(img_url))
+
+    for title, url in re.findall(
+        r"\[([^\]]+)\]\((https?://[^\s)\"]+)(?:\s+\"[^\"]*\")?\)", html
+    ):
+        url = _normalize_href(url)
+        if not (url.startswith(BASE_URL + "/listen/") or url.startswith("https://www.halmblog.com/listen/")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        artist, title = _split_artist_title(title)
+        results.append({
+            "title": title,
+            "artist": artist,
+            "page_url": url,
+            "thumbnail": thumb_by_listen.get(url, ""),
+            "date": "",
+            "page_slug": url.rstrip("/").split("/")[-1],
+        })
+    return results
+
+
 # ─── Scrape Individual Song Page ─────────────────────────────────────────────
+def _markdown_title(html: str) -> str:
+    """Extract the page title from r.jina.ai reader-mode output ("Title: ...")."""
+    m = re.search(r"^Title:\s*(.+)$", html, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _markdown_thumbnail(html: str) -> str:
+    """Extract the first song-image URL from r.jina.ai markdown output."""
+    m = re.search(
+        r"!\[[^\]]*\]\((https?://[^\s)\"]+\.(?:jpe?g|png|webp)[^\s)\"]*)\)",
+        html, re.IGNORECASE,
+    )
+    return _normalize_href(m.group(1)) if m else ""
+
+
 def scrape_song_page(page_url: str) -> dict:
     """Scrape a halmblog song page for direct MP3 URL + metadata.
 
@@ -357,10 +475,16 @@ def scrape_song_page(page_url: str) -> dict:
     raw_t = h1.get_text(strip=True) if h1 else ""
     artist, title = _split_artist_title(raw_t)
 
+    # Reader proxies (r.jina.ai) return markdown, not HTML — pull the title
+    # from its "Title: <song> by <artist>" header and thumbnails from images.
+    if not raw_t:
+        raw_t = _markdown_title(html)
+        artist, title = _split_artist_title(raw_t)
+
     # Gather every candidate MP3 href: <audio> src, anchors containing ".mp3"
     # (halmblog puts the real file in a plain <a href="...mp3"> in the post
     # body — no audio tag, no download-button class), then a regex over the
-    # raw HTML as a final net.
+    # raw HTML as a final net (also catches links in markdown output).
     mp3_url = None
     mp3_url_fallback = None
     candidates = []
@@ -394,6 +518,8 @@ def scrape_song_page(page_url: str) -> dict:
     img = entry.find("img")
     if img:
         thumb = _normalize_href(img.get("data-src") or img.get("data-lazy-src") or img.get("src", ""))
+    if not thumb:
+        thumb = _markdown_thumbnail(html)
 
     result = {
         "title": title or raw_t,
@@ -439,11 +565,14 @@ def build_cache(max_pages: int = 2) -> dict:
                 for idx, s in enumerate(all_songs):
                     if s["page_url"] == key:
                         song = all_songs.pop(idx)
-                        # Preserve existing mp3_url if we have it
+                        # Preserve existing mp3_url/thumbnail if the fresh
+                        # listing didn't provide one (markdown listings often
+                        # have no image).
                         all_songs.insert(0, {
                             **item,
                             "mp3_url": song.get("mp3_url"),
                             "has_mp3": bool(song.get("mp3_url")),
+                            "thumbnail": item.get("thumbnail") or song.get("thumbnail", ""),
                             "scraped_at": song.get("scraped_at", datetime.now().isoformat()),
                         })
                         updated_cnt += 1
@@ -501,6 +630,7 @@ def check_for_updates() -> int:
     listings = scrape_listing(page=1)
     added = 0
     reordered = 0
+    meta_changed = 0
 
     for i, item in enumerate(listings):
         key = item["page_url"]
@@ -523,25 +653,33 @@ def check_for_updates() -> int:
                             **item,
                             "mp3_url": song.get("mp3_url"),
                             "has_mp3": bool(song.get("mp3_url")),
+                            "thumbnail": item.get("thumbnail") or song.get("thumbnail", ""),
                             "scraped_at": song.get("scraped_at", datetime.now().isoformat()),
                         })
                         reordered += 1
                     else:
                         # Update metadata in place (title, thumbnail, date may change)
-                        cache["songs"][i].update({
-                            "title": item["title"],
-                            "artist": item["artist"],
-                            "thumbnail": item["thumbnail"],
-                            "date": item["date"],
-                        })
+                        # — keep the old thumbnail if the fresh listing has none.
+                        old = cache["songs"][i]
+                        new_thumb = item.get("thumbnail") or old.get("thumbnail", "")
+                        if (item["title"], item["artist"], item["date"], new_thumb) != (
+                            old.get("title"), old.get("artist"), old.get("date"), old.get("thumbnail", "")
+                        ):
+                            old.update({
+                                "title": item["title"],
+                                "artist": item["artist"],
+                                "thumbnail": new_thumb,
+                                "date": item["date"],
+                            })
+                            meta_changed += 1
                     break
 
-    total_changes = added + reordered
+    total_changes = added + reordered + meta_changed
     if total_changes > 0:
         cache["last_updated"] = datetime.now().isoformat()
         with _CACHE_LOCK:
             _save_cache(cache)
-        logger.info("Ghana cache updated: +%d new, %d reordered (total %d)", added, reordered, len(cache["songs"]))
+        logger.info("Ghana cache updated: +%d new, %d reordered, %d metadata (total %d)", added, reordered, meta_changed, len(cache["songs"]))
     else:
         logger.info("Ghana cache: no new listings")
     return total_changes
@@ -838,46 +976,68 @@ def resume_deep_cache(max_pages: int = 100) -> int:
     """Continue deep cache from the deepest page we already reached.
     Progress is persisted as 'max_page' in the cache file, so repeated
     clicks genuinely walk further into the archive (page 1 is kept fresh
-    by check_for_updates). Saves incrementally so long crawls aren't lost.
+    by check_for_updates). max_pages is how many MORE pages to crawl past
+    the current max_page. Saves incrementally so long crawls aren't lost.
+    Only one crawl runs at a time (manual button + background crawler share
+    the worker); a concurrent call returns 0 immediately.
     """
-    cache = _load_cache()
-    existing = _by_url(cache)
-    start_page = int(cache.get("max_page") or 1) + 1
-    new_cnt = 0
-    deepest = start_page - 1
-    logger.info("Deep cache resume: %d songs, start page %d", len(existing), start_page)
+    if not _DEEP_CACHE_LOCK.acquire(blocking=False):
+        logger.info("Deep cache crawl already running — skipping this request")
+        return 0
 
-    for p in range(start_page, max_pages + 1):
-        listings = scrape_listing(page=p)
-        if not listings:
-            break
-        added_on_page = 0
-        for item in listings:
-            key = item["page_url"]
-            if key not in existing:
-                cache["songs"].append({
-                    **item,
-                    "mp3_url": None,
-                    "has_mp3": False,
-                    "scraped_at": datetime.now().isoformat(),
-                })
-                existing[key] = True
-                new_cnt += 1
-                added_on_page += 1
-        deepest = p
-        time.sleep(0.35)
-        # Save progress incrementally so the live song count updates in the UI
-        # and a long crawl isn't lost if the server restarts.
-        if added_on_page > 0 or deepest == max_pages:
-            cache["max_page"] = deepest
+    try:
+        cache = _load_cache()
+        existing = _by_url(cache)
+        start_page = int(cache.get("max_page") or 1) + 1
+        end_page = start_page + max_pages - 1
+        new_cnt = 0
+        deepest = start_page - 1   # last page that yielded songs
+        last_tried = start_page - 1  # last page actually requested
+        consecutive_empty = 0
+        logger.info("Deep cache resume: %d songs, crawl pages %d–%d", len(existing), start_page, end_page)
+
+        for p in range(start_page, end_page + 1):
+            last_tried = p
+            listings = scrape_listing(page=p)
+            if not listings:
+                # Archive gap (404 page, or no Wayback snapshot) — keep going,
+                # but bail out once it looks like the real end of the archive.
+                consecutive_empty += 1
+                if consecutive_empty >= _DEEP_EMPTY_STOP:
+                    break
+                continue
+            consecutive_empty = 0
+            added_on_page = 0
+            for item in listings:
+                key = item["page_url"]
+                if key not in existing:
+                    cache["songs"].append({
+                        **item,
+                        "mp3_url": None,
+                        "has_mp3": False,
+                        "scraped_at": datetime.now().isoformat(),
+                    })
+                    existing[key] = True
+                    new_cnt += 1
+                    added_on_page += 1
+            deepest = p
+            time.sleep(0.35)
+            # Save progress incrementally so the live song count updates in the UI
+            # and a long crawl isn't lost if the server restarts.
+            if added_on_page > 0 or deepest == end_page:
+                cache["max_page"] = deepest
+                cache["last_updated"] = datetime.now().isoformat()
+                with _CACHE_LOCK:
+                    _save_cache(cache)
+
+        # Persist how far we actually walked (even past empty gap pages) so the
+        # next resume skips the gaps we already know are empty.
+        if last_tried > start_page - 1:
+            cache["max_page"] = last_tried
             cache["last_updated"] = datetime.now().isoformat()
             with _CACHE_LOCK:
                 _save_cache(cache)
-
-    if new_cnt > 0:
-        cache["max_page"] = deepest
-        cache["last_updated"] = datetime.now().isoformat()
-        with _CACHE_LOCK:
-            _save_cache(cache)
-    logger.info("Deep cache resume: +%d (total %d, deepest page %d)", new_cnt, len(cache["songs"]), deepest)
-    return new_cnt
+        logger.info("Deep cache resume: +%d (total %d, deepest page %d)", new_cnt, len(cache["songs"]), deepest)
+        return new_cnt
+    finally:
+        _DEEP_CACHE_LOCK.release()

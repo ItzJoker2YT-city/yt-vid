@@ -36,12 +36,37 @@ YTDLP_BASE_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "extract_flat": False,
-    "socket_timeout": 30,
+    "socket_timeout": 15,
     "nocheckcertificate": True,
     "ignoreerrors": True,
     "no_color": True,
     "geo_bypass": True,
+    "retries": 2,          # fail fast so proxy failover kicks in quickly
+    "fragment_retries": 1,
 }
+
+# ─── YouTube authentication (cookies) ────────────────────────────────────────
+# YouTube bot-checks datacenter IPs, so downloads may return
+# "Sign in to confirm you're not a bot". Drop a Netscape-format cookies.txt
+# (exported from a logged-in browser; a throwaway account is recommended) at
+# YTDLP_COOKIES_FILE to unlock downloads. Absent = anonymous downloads.
+YTDLP_COOKIES_FILE = os.environ.get(
+    "YTDLP_COOKIES_FILE",
+    os.path.join(BASE_DIR, "cookies.txt"),
+)
+
+# ─── JavaScript runtime for PO-token providers ──────────────────────────────
+# Enables bgutil/yt-dlp-ejs POT providers (e.g. /opt/deno/bin/deno). Set to ""
+# to disable. Only used when the binary exists.
+YTDLP_JS_RUNTIME = os.environ.get("YTDLP_JS_RUNTIME", "/opt/deno/bin/deno")
+
+# ─── Outbound proxy rotation for YouTube downloads ────────────────────────
+# THE permanent fix for the datacenter-IP bot block: route YouTube traffic
+# through clean/residential IPs. Comma-separated list of proxies — the engine
+# round-robins across them and fails over to the next one if a proxy is
+# bot-flagged or unreachable. Format: http://user:pass@host:port,
+# socks5://host:port, socks4://host:port. Leave "" to connect directly.
+YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "")
 
 # ─── Maximum concurrent downloads ────────────────────────────────────────────
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT", "3"))

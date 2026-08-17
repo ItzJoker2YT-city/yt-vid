@@ -3,12 +3,14 @@ Flask web application — routes and API endpoints for the YT-MP3 downloader.
 """
 import os
 import json
+import re
 import logging
 import zipfile
 import tempfile
 import mimetypes
 import threading
 import time
+from urllib.parse import quote as _url_quote
 from logging.handlers import RotatingFileHandler
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
@@ -37,6 +39,9 @@ formatter = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(mess
 handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 logging.getLogger("engine").addHandler(handler)
+halmblog_logger = logging.getLogger("halmblog")
+halmblog_logger.addHandler(handler)
+halmblog_logger.setLevel(logging.INFO)
 
 # ─── Cache Pre-warming ────────────────────────────────────────────────────────
 # Pre-warm search cache for top trending artists in the background so the
@@ -245,7 +250,7 @@ def api_search():
     if not query:
         return jsonify({"error": "No search query provided"}), 400
 
-    results = engine.search_youtube(query, max_results=12)
+    results = engine.search_youtube(query, max_results=48)
     return jsonify({"results": results})
 
 
@@ -531,6 +536,18 @@ def api_settings():
 
 # ─── Streaming helpers start ---------------------------------------------------
 
+def _safe_disposition(filename: str) -> str:
+    """Build a latin-1-safe Content-Disposition filename value.
+    Waitress encodes response headers as latin-1, so a filename with non-ASCII
+    characters (e.g. 'Ɛ' in Ghanaian titles) crashes the response. The ASCII
+    fallback goes in plain `filename=`; the exact name rides in the RFC 5987
+    `filename*=UTF-8''...` token."""
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii").strip() or "download"
+    ascii_name = re.sub(r'[\\/"]', "_", ascii_name)
+    encoded = _url_quote(filename, safe="")
+    return f'filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
+
+
 def stream_and_delete(file_path, original_tasks=None, task_ref=None):
     """
     Generator that streams a file in chunks and then deletes it from disk.
@@ -579,7 +596,7 @@ def api_download_file(task_id):
         if history_entry and os.path.exists(history_entry["filepath"]):
             mime_type, _ = mimetypes.guess_type(history_entry["filepath"])
             return Response(stream_and_delete(history_entry["filepath"]), headers={
-                "Content-Disposition": f"attachment; filename=\"{history_entry['filename']}\"",
+                "Content-Disposition": f"attachment; {_safe_disposition(history_entry['filename'])}",
                 "Content-Type": mime_type or "application/octet-stream"
             })
         return jsonify({"error": "File not found"}), 404
@@ -591,7 +608,7 @@ def api_download_file(task_id):
     # Pass task_ref so filepath is cleared AFTER streaming completes,
     # not before — this prevents the Save button from vanishing prematurely.
     response = Response(stream_and_delete(task.filepath, task_ref=task), headers={
-        "Content-Disposition": f"attachment; filename=\"{task.filename}\"",
+        "Content-Disposition": f"attachment; {_safe_disposition(task.filename)}",
         "Content-Type": mime_type or "application/octet-stream"
     })
     return response
@@ -681,7 +698,7 @@ def _generate_zip(tasks, base_filename):
         return Response(
             stream_and_delete(temp_zip_path, original_tasks=tasks),
             headers={
-                "Content-Disposition": f"attachment; filename=\"{safe_title}.zip\"",
+                "Content-Disposition": f"attachment; {_safe_disposition(safe_title + '.zip')}",
                 "Content-Type": "application/zip",
             },
         )

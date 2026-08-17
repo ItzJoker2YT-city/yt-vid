@@ -189,10 +189,28 @@
                 </script>
             </div>
 
+            <div id="search-toolbar" style="display:none; margin-bottom:1rem; flex-wrap:wrap; align-items:center; gap:0.75rem;">
+                <label class="latest-toggle" title="Hide videos longer than 15 minutes">
+                    <input type="checkbox" id="search-songs-only" onchange="reRenderSearch()">
+                    <span class="toggle-track"><span class="toggle-thumb"></span></span>
+                    <span style="font-size:0.8rem;color:var(--text-secondary);white-space:nowrap">🎵 Songs only</span>
+                </label>
+                <select id="search-sort" class="input-field" style="width:auto; padding:0.5rem 0.85rem; font-size:0.85rem;"
+                        onchange="reRenderSearch()">
+                    <option value="relevance">Sort: Relevance</option>
+                    <option value="views">Sort: Most viewed</option>
+                </select>
+                <span id="search-count" style="font-size:0.8rem;color:var(--text-muted);margin-left:auto"></span>
+            </div>
+
             <div class="search-results" id="search-results">
                 <div style="grid-column: 1/-1; text-align:center; padding:3rem; color:var(--text-muted)">
                     Click an artist above or type a search query to find YouTube videos.
                 </div>
+            </div>
+            <div style="text-align:center; margin-top:1.5rem;">
+                <button class="btn btn-secondary" id="search-load-more" style="display:none"
+                        onclick="loadMoreSearch()">⬇️ Load more results</button>
             </div>
         </section>
 

@@ -1,0 +1,26 @@
+# Secrets — never commit
+cookies.txt
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# App runtime data
+data/app.log*
+data/ghana_music.json
+data/ghana_music.db
+data/history.json
+
+# Downloads
+*.mp3
+*.mp4
+*.webm
+*.m4a
+*.part
+*.ytdl
+*.jpg
+*.jpeg
+*.png

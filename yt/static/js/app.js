@@ -42,6 +42,11 @@ let downloadedUrls = new Set();      // video URLs already in history
 let artistDownloadCounts = {};       // artist name -> count from history
 let _searchAbortCtrl  = null;        // AbortController for doSearch
 let _albumsAbortCtrl  = null;        // AbortController for fetchArtistAlbums
+let _searchAllResults = [];          // full fetched result set (pre filter/sort/paging)
+let _searchArtistLabel = null;       // artist badge shown above results
+let _searchPageSize   = 12;          // results revealed per "Load more"
+let _searchRendered   = 0;           // how many visible results are currently shown
+let _searchTasks      = new Map();   // video id -> { task_id, timer, status, progress, filename, error_message }
 
 // ─── DOM Ready ───────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -798,7 +803,10 @@ async function doSearch(queryOverride, artistLabel) {
         if (data.error) {
             container.innerHTML = `<div style="text-align:center;padding:2rem;color:var(--danger)">${data.error}</div>`;
         } else {
-            renderSearchResults(data.results || [], artistLabel || null);
+            _searchAllResults = data.results || [];
+            _searchArtistLabel = artistLabel || null;
+            _searchRendered = _searchPageSize;
+            renderSearchResults();
         }
     } catch (err) {
         if (err.name === 'AbortError') return;  // user switched artist — silently discard
@@ -811,30 +819,45 @@ async function doSearch(queryOverride, artistLabel) {
     }
 }
 
-function renderSearchResults(results, artistLabel) {
+function renderSearchResults() {
     const container = document.getElementById('search-results');
+    if (!container) return;
+    const toolbar = document.getElementById('search-toolbar');
+    const loadMoreBtn = document.getElementById('search-load-more');
 
-    if (results.length === 0) {
+    const filtered = applySearchFilters(_searchAllResults);
+
+    if (filtered.length === 0) {
         container.innerHTML = '<div style="text-align:center;padding:2rem;color:var(--text-muted)">No results found.</div>';
+        if (toolbar) toolbar.style.display = 'none';
+        if (loadMoreBtn) loadMoreBtn.style.display = 'none';
         return;
     }
+    if (toolbar) toolbar.style.display = 'flex';
 
-    const heading = artistLabel
+    const countEl = document.getElementById('search-count');
+    if (countEl) countEl.textContent = `${_searchRendered} of ${filtered.length} results`;
+
+    const heading = _searchArtistLabel
         ? `<div class="artist-results-heading">
                🎵 Latest songs &nbsp;·&nbsp;
-               <span class="artist-badge">${escapeHtml(artistLabel)}</span>
-               <span style="margin-left:auto;font-size:0.76rem;color:var(--text-muted)">${results.length} results</span>
+               <span class="artist-badge">${escapeHtml(_searchArtistLabel)}</span>
+               <span style="margin-left:auto;font-size:0.76rem;color:var(--text-muted)">${filtered.length} results</span>
            </div>`
         : '';
 
-    container.innerHTML = heading + results.map(r => {
+    const visible = filtered.slice(0, _searchRendered);
+
+    container.innerHTML = heading + visible.map(r => {
         const viewsStr = r.views ? formatNumber(r.views) + ' views' : '';
         // Extract video ID from URL for history check
         const vidId = (r.url.match(/[?&]v=([^&]+)/) || [])[1] || r.id || '';
+        const taskKey = vidId || r.url;
         const alreadyDl = downloadedIds.has(vidId) || downloadedUrls.has(r.url);
         const dlBadge = alreadyDl
             ? `<span class="already-dl-badge">✅ Already Downloaded</span>`
             : '';
+        const dlActive = _searchTasks.has(taskKey);
         return `
         <div class="search-result-card">
             <div class="search-thumb">
@@ -847,22 +870,155 @@ function renderSearchResults(results, artistLabel) {
                 <div class="channel">${escapeHtml(r.channel)}${viewsStr ? ' · ' + viewsStr : ''}</div>
                 ${dlBadge}
                 <div class="dl-row">
-                    <select class="fmt-select" id="fmt-${escapeHtml(vidId || r.url)}">
+                    <select class="fmt-select" id="fmt-${escapeHtml(taskKey)}">
                         <option value="audio">🎵 MP3 320kbps</option>
                         <option value="video">🎥 MP4 HD</option>
                     </select>
                     <button class="btn btn-primary btn-sm" style="flex:1"
-                            onclick="downloadFromSearch('${escapeHtml(r.url)}', '${escapeHtml(vidId || r.url)}')"
+                            data-key="${escapeHtml(taskKey)}"
+                            data-dl-type="audio"
+                            ${dlActive ? 'disabled' : ''}
+                            onclick="downloadFromSearch('${escapeHtml(r.url)}', '${escapeHtml(taskKey)}', this)"
                     >⬇️ Download</button>
                 </div>
+                <div class="search-progress-wrap"></div>
             </div>
         </div>`;
     }).join('');
+
+    if (loadMoreBtn) loadMoreBtn.style.display = filtered.length > _searchRendered ? '' : 'none';
+
+    // Restore in-flight/downloaded progress UIs after a re-render
+    _searchTasks.forEach((_, key) => renderSearchProgress(key));
 }
 
-async function downloadFromSearch(url, fmtKey) {
+function reRenderSearch() {
+    _searchRendered = _searchPageSize;
+    renderSearchResults();
+}
+
+function loadMoreSearch() {
+    _searchRendered += _searchPageSize;
+    renderSearchResults();
+}
+
+function applySearchFilters(list) {
+    let out = list.slice();
+    const songsOnly = document.getElementById('search-songs-only')?.checked;
+    if (songsOnly) {
+        out = out.filter(r => {
+            const secs = parseSearchDuration(r.duration);
+            return secs > 0 && secs <= 900; // songs = short videos (≤ 15 min)
+        });
+    }
+    const sort = document.getElementById('search-sort')?.value || 'relevance';
+    if (sort === 'views') {
+        out.sort((a, b) => (b.views || 0) - (a.views || 0));
+    }
+    return out;
+}
+
+function parseSearchDuration(dur) {
+    // "4:32" or "1:02:03" or "" → seconds
+    if (!dur) return 0;
+    const parts = String(dur).split(':').map(Number);
+    if (parts.some(isNaN)) return 0;
+    let secs = 0;
+    for (const p of parts) secs = secs * 60 + p;
+    return secs;
+}
+
+// ─── Per-result inline download progress (stays on the Search page) ─────────
+function startSearchTask(key, taskId, dlType) {
+    if (!key || !taskId) return;
+    const existing = _searchTasks.get(key);
+    if (existing && existing.timer) clearTimeout(existing.timer);
+    _searchTasks.set(key, {
+        task_id: taskId, timer: null, status: 'queued',
+        progress: 0, filename: '', error_message: '', dl_type: dlType || 'audio'
+    });
+    document.querySelectorAll('.search-result-card button[data-key]').forEach(b => {
+        if (b.dataset.key === key) b.disabled = true;
+    });
+    renderSearchProgress(key);
+    pollSearchTask(key);
+}
+
+async function pollSearchTask(key) {
+    const state = _searchTasks.get(key);
+    if (!state || !state.task_id) return;
+    try {
+        const res = await fetch(`/api/task/${state.task_id}`);
+        if (!res.ok) { endSearchTask(key, 'error'); return; }
+        const task = await res.json();
+        state.status = task.status || 'downloading';
+        state.progress = typeof task.progress === 'number' ? task.progress : 0;
+        state.filename = task.filename || '';
+        state.error_message = task.error_message || '';
+        renderSearchProgress(key);
+        if (task.status === 'done' || task.status === 'error') {
+            endSearchTask(key, task.status);
+        } else {
+            state.timer = setTimeout(() => pollSearchTask(key), 1200);
+        }
+    } catch {
+        // transient network hiccup — keep polling
+        state.timer = setTimeout(() => pollSearchTask(key), 2500);
+    }
+}
+
+function endSearchTask(key, status) {
+    const state = _searchTasks.get(key);
+    if (!state) return;
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    state.status = status;
+    renderSearchProgress(key);
+    document.querySelectorAll('.search-result-card button[data-key]').forEach(b => {
+        if (b.dataset.key === key) b.disabled = false;
+    });
+}
+
+function renderSearchProgress(key) {
+    const state = _searchTasks.get(key);
+    document.querySelectorAll('.search-result-card').forEach(card => {
+        const btn = card.querySelector('.dl-row button[data-key]');
+        if (!btn || btn.dataset.key !== key) return;
+        const wrap = card.querySelector('.search-progress-wrap');
+        if (!wrap) return;
+
+        if (state && state.status === 'done') {
+            const mime = state.dl_type === 'video' ? 'MP4' : 'MP3';
+            wrap.innerHTML = `<a class="btn btn-sm btn-success ghana-save-btn"
+                href="/api/download-file/${state.task_id}"
+                download="${state.filename ? escapeHtml(state.filename) : ''}">⬇️ Save ${mime}</a>`;
+            return;
+        }
+        if (!state || state.status === 'error') {
+            wrap.innerHTML = state && state.status === 'error'
+                ? `<div class="ghana-progress-error">⚠️ ${escapeHtml(state.error_message || 'Download failed')}</div>`
+                : '';
+            return;
+        }
+
+        const pct = Math.min(100, Math.max(0, Math.round(state.progress)));
+        const label = state.status === 'converting'
+            ? 'Converting…'
+            : state.status === 'queued' ? 'Queued…' : 'Downloading…';
+        wrap.innerHTML = `
+            <div class="ghana-progress">
+                <div class="ghana-progress-bar"><div class="ghana-progress-fill" style="width:${pct}%"></div></div>
+                <div class="ghana-progress-label">${label} ${pct}%</div>
+            </div>`;
+    });
+}
+
+async function downloadFromSearch(url, taskKey, btnEl) {
+    if (!taskKey) {
+        const m = url.match(/[?&]v=([^&]+)/);
+        taskKey = (m && m[1]) || url;
+    }
     // Determine format from the select in this card
-    const sel = document.getElementById(`fmt-${fmtKey}`);
+    const sel = document.getElementById(`fmt-${taskKey}`);
     const dlType = sel ? sel.value : 'audio';
     const quality = dlType === 'video' ? 'best' : '320'; // always highest
 
@@ -878,6 +1034,8 @@ async function downloadFromSearch(url, fmtKey) {
         } else {
             const label = dlType === 'video' ? 'MP4' : 'MP3 (320kbps)';
             showToast(`⬇️ Queued ${label} download!`, 'success');
+            const taskId = (data.tasks && data.tasks[0] && data.tasks[0].id) || null;
+            startSearchTask(taskKey, taskId, dlType);
             // Refresh history IDs so badge appears
             loadHistoryIds();
         }
@@ -984,6 +1142,7 @@ let _ghanaSearchTotal = 0;
 let _ghanaRefreshTimer = null;    // auto-refresh timer when on Ghana Music tab
 let _lastGhanaSongCount = 0;       // detect new additions
 let _lastGhanaTopUrl = "";         // compare first song to detect new posts
+let _ghanaTasks = new Map();       // page_url -> { task_id, timer, status, progress, filename, error_message }
 
 // ─── Auto-refresh Ghana Music every 30s when on the tab ─────────────────
 function startGhanaAutoRefresh() {
@@ -1192,6 +1351,7 @@ function renderGhanaMusic(songs) {
     grid.innerHTML = songs.map((s, idx) => {
         const hasMp3 = Boolean(s.mp3_url);
         const selected = _ghanaSelected.has(s.page_url);
+        const dlActive = _ghanaTasks.has(s.page_url);
 
         return `
         <div class="ghana-song-card ${selected ? 'selected' : ''}" data-idx="${idx}" data-url="${escapeHtml(s.page_url)}">
@@ -1205,30 +1365,122 @@ function renderGhanaMusic(songs) {
                 <div class="ghana-actions">
                     <label class="ghana-check">
                         <input type="checkbox" ${selected ? 'checked' : ''}
-                               onchange="toggleGhanaSelect('${escapeHtml(s.page_url)}')">
+                               onchange="toggleGhanaSelect('${jsStr(s.page_url)}')">
                         <span>Select</span>
                     </label>
                     ${hasMp3
-                        ? `<button class="btn btn-sm btn-primary" onclick="downloadGhanaSong('${escapeHtml(s.mp3_url)}',
-                            '${escapeHtml(s.title)}',
-                            '${escapeHtml(s.artist || '')}',
-                            '${escapeHtml(s.thumbnail)}',
-                            '${escapeHtml(s.mp3_url_fallback || '')}', this)">⬇️ Download</button>`
-                        : `<button class="btn btn-sm btn-primary" onclick="fetchGhanaMp3('${escapeHtml(s.page_url)}',
-                            '${escapeHtml(s.title)}',
-                            '${escapeHtml(s.artist || '')}',
-                            '${escapeHtml(s.thumbnail)}', this)">
+                        ? `<button class="btn btn-sm btn-primary" ${dlActive ? 'disabled' : ''} onclick="downloadGhanaSong('${jsStr(s.page_url)}','${jsStr(s.mp3_url)}',
+                            '${jsStr(s.title)}',
+                            '${jsStr(s.artist || '')}',
+                            '${jsStr(s.thumbnail)}',
+                            '${jsStr(s.mp3_url_fallback || '')}', this)">⬇️ Download</button>`
+                        : `<button class="btn btn-sm btn-primary" ${dlActive ? 'disabled' : ''} onclick="fetchGhanaMp3('${jsStr(s.page_url)}',
+                            '${jsStr(s.title)}',
+                            '${jsStr(s.artist || '')}',
+                            '${jsStr(s.thumbnail)}', this)">
                             🔍 Fetch MP3
                            </button>`
                     }
-                    <button class="btn btn-sm btn-secondary" title="Download this song from YouTube (works even when halmblog blocks direct MP3s)" onclick="downloadGhanaViaYouTube('${escapeHtml(s.title)}', '${escapeHtml(s.artist || '')}', this)">🎬 YouTube MP3</button>
-                    <button class="btn btn-sm btn-secondary" onclick="window.open('${escapeHtml(s.page_url)}','_blank')">👁️ View</button>
+                    <button class="btn btn-sm btn-secondary" ${dlActive ? 'disabled' : ''} title="Download this song from YouTube (works even when halmblog blocks direct MP3s)" onclick="downloadGhanaViaYouTube('${jsStr(s.page_url)}', '${jsStr(s.title)}', '${jsStr(s.artist || '')}', this)">🎬 YouTube MP3</button>
+                    <button class="btn btn-sm btn-secondary" onclick="window.open('${jsStr(s.page_url)}','_blank')">👁️ View</button>
                 </div>
+                <div class="ghana-progress-wrap"></div>
             </div>
         </div>`;
     }).join('');
 
+    // Restore any in-flight/downloaded progress UIs after a re-render
+    _ghanaSongs.forEach(s => { if (_ghanaTasks.has(s.page_url)) renderGhanaProgress(s.page_url); });
+
     updateGhanaSelectCount();
+}
+
+// Safely embed a string inside a single-quoted JS string in an inline handler
+function jsStr(s) {
+    if (s === undefined || s === null) return '';
+    return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+// ─── Per-song inline download progress (stays on the Ghana Music page) ──────
+function startGhanaTask(pageUrl, taskId, btnEl) {
+    if (!pageUrl || !taskId) return;
+    const existing = _ghanaTasks.get(pageUrl);
+    if (existing && existing.timer) clearTimeout(existing.timer);
+    _ghanaTasks.set(pageUrl, {
+        task_id: taskId, timer: null, status: 'queued',
+        progress: 0, filename: '', error_message: ''
+    });
+    if (btnEl) btnEl.disabled = true;
+    renderGhanaProgress(pageUrl);
+    pollGhanaTask(pageUrl);
+}
+
+async function pollGhanaTask(pageUrl) {
+    const state = _ghanaTasks.get(pageUrl);
+    if (!state || !state.task_id) return;
+    try {
+        const res = await fetch(`/api/task/${state.task_id}`);
+        if (!res.ok) { endGhanaTask(pageUrl, 'error'); return; }
+        const task = await res.json();
+        state.status = task.status || 'downloading';
+        state.progress = typeof task.progress === 'number' ? task.progress : 0;
+        state.filename = task.filename || '';
+        state.error_message = task.error_message || '';
+        renderGhanaProgress(pageUrl);
+        if (task.status === 'done' || task.status === 'error') {
+            endGhanaTask(pageUrl, task.status);
+        } else {
+            state.timer = setTimeout(() => pollGhanaTask(pageUrl), 1200);
+        }
+    } catch {
+        // transient network hiccup — keep polling
+        state.timer = setTimeout(() => pollGhanaTask(pageUrl), 2500);
+    }
+}
+
+function endGhanaTask(pageUrl, status) {
+    const state = _ghanaTasks.get(pageUrl);
+    if (!state) return;
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    state.status = status;
+    renderGhanaProgress(pageUrl);
+    // Re-enable the card's action buttons now that the task is finished
+    document.querySelectorAll('.ghana-song-card').forEach(card => {
+        if (card.dataset.url !== pageUrl) return;
+        card.querySelectorAll('.ghana-actions button').forEach(b => { b.disabled = false; });
+    });
+}
+
+function renderGhanaProgress(pageUrl) {
+    const state = _ghanaTasks.get(pageUrl);
+    document.querySelectorAll('.ghana-song-card').forEach(card => {
+        if (card.dataset.url !== pageUrl) return;
+        const wrap = card.querySelector('.ghana-progress-wrap');
+        if (!wrap) return;
+
+        if (state && state.status === 'done') {
+            wrap.innerHTML = `<a class="btn btn-sm btn-success ghana-save-btn"
+                href="/api/download-file/${state.task_id}"
+                download="${state.filename ? escapeHtml(state.filename) : ''}">⬇️ Save MP3</a>`;
+            return;
+        }
+        if (!state || state.status === 'error') {
+            wrap.innerHTML = state && state.status === 'error'
+                ? `<div class="ghana-progress-error">⚠️ ${escapeHtml(state.error_message || 'Download failed')}</div>`
+                : '';
+            return;
+        }
+
+        const pct = Math.min(100, Math.max(0, Math.round(state.progress)));
+        const label = state.status === 'converting'
+            ? 'Converting…'
+            : state.status === 'queued' ? 'Queued…' : 'Downloading…';
+        wrap.innerHTML = `
+            <div class="ghana-progress">
+                <div class="ghana-progress-bar"><div class="ghana-progress-fill" style="width:${pct}%"></div></div>
+                <div class="ghana-progress-label">${label} ${pct}%</div>
+            </div>`;
+    });
 }
 
 function toggleGhanaSelect(pageUrl) {
@@ -1295,7 +1547,7 @@ function updateGhanaSelectCount() {
     if (btn) btn.disabled = count === 0;
 }
 
-async function downloadGhanaSong(mp3Url, title, artist, thumbnail, fallbackUrl, btnEl) {
+async function downloadGhanaSong(pageUrl, mp3Url, title, artist, thumbnail, fallbackUrl, btnEl) {
     if (!mp3Url) return;
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Queuing...'; }
 
@@ -1311,9 +1563,8 @@ async function downloadGhanaSong(mp3Url, title, artist, thumbnail, fallbackUrl, 
             if (btnEl) { btnEl.disabled = false; btnEl.textContent = '⬇️ Download'; }
         } else {
             showToast('⬇️ Queued halmblog MP3 (320kbps)!', 'success');
-            if (btnEl) { btnEl.textContent = '✅ Queued'; }
+            startGhanaTask(pageUrl, data.task_id, btnEl);
             loadHistoryIds();
-            setTimeout(() => switchTab('download'), 800);
         }
     } catch {
         showToast('Network error — is the server running?', 'error');
@@ -1321,7 +1572,7 @@ async function downloadGhanaSong(mp3Url, title, artist, thumbnail, fallbackUrl, 
     }
 }
 
-async function downloadGhanaViaYouTube(title, artist, btnEl) {
+async function downloadGhanaViaYouTube(pageUrl, title, artist, btnEl) {
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ Searching YouTube...'; }
     try {
         const res = await fetch('/api/ghana-music/youtube-download', {
@@ -1336,9 +1587,9 @@ async function downloadGhanaViaYouTube(title, artist, btnEl) {
             return;
         }
         showToast(`🎬 Queued "${data.youtube_title || (artist + ' ' + title)}" from YouTube (320kbps)!`, 'success');
-        if (btnEl) { btnEl.textContent = '✅ Queued'; }
+        const taskId = (data.tasks && data.tasks[0] && data.tasks[0].id) || null;
+        startGhanaTask(pageUrl, taskId, btnEl);
         loadHistoryIds();
-        setTimeout(() => switchTab('download'), 800);
     } catch {
         showToast('Network error — is the server running?', 'error');
         if (btnEl) { btnEl.disabled = false; btnEl.textContent = '🎬 YouTube MP3'; }
@@ -1362,7 +1613,7 @@ async function fetchGhanaMp3(pageUrl, title, artist, thumbnail, btnEl) {
             showToast(data.fetch_error
                 ? 'Direct MP3 blocked by halmblog — falling back to YouTube...'
                 : 'No direct MP3 link — falling back to YouTube...', 'info');
-            downloadGhanaViaYouTube(title, artist, btnEl);
+            downloadGhanaViaYouTube(pageUrl, title, artist, btnEl);
             return;
         }
         // Update the song in _ghanaSongs so future renders show the Download button
@@ -1374,7 +1625,7 @@ async function fetchGhanaMp3(pageUrl, title, artist, thumbnail, btnEl) {
         // Re-render with the new MP3
         renderGhanaMusic(_ghanaSongs);
         // Auto-download
-        downloadGhanaSong(data.mp3_url, data.title || title, data.artist || artist, data.thumbnail || thumbnail, data.mp3_url_fallback || '', null);
+        downloadGhanaSong(pageUrl, data.mp3_url, data.title || title, data.artist || artist, data.thumbnail || thumbnail, data.mp3_url_fallback || '', null);
         showToast('MP3 found! Queuing download...', 'success');
     } catch (e) {
         showToast('Failed to fetch MP3 link', 'error');
@@ -1446,7 +1697,10 @@ async function downloadSelectedGhana() {
                 body: JSON.stringify({ mp3_url: song.mp3_url, fallback_url: song.mp3_url_fallback || '', title: song.title, artist: song.artist || '', thumbnail: song.thumbnail, quality: '320', dl_type: 'audio' })
             });
             const data = await res.json();
-            if (!data.error) { okCount++; }
+            if (!data.error) {
+                okCount++;
+                startGhanaTask(song.page_url, data.task_id, null);
+            }
         } catch { /* ignore individual failures in batch */ }
     }
 
@@ -1460,7 +1714,11 @@ async function downloadSelectedGhana() {
                 body: JSON.stringify({ title: song.title || '', artist: song.artist || '' })
             });
             const data = await res.json();
-            if (!data.error) { ytCount++; }
+            if (!data.error) {
+                ytCount++;
+                const taskId = (data.tasks && data.tasks[0] && data.tasks[0].id) || null;
+                startGhanaTask(song.page_url, taskId, null);
+            }
         } catch { /* ignore individual failures in batch */ }
     }
 
@@ -1478,7 +1736,6 @@ async function downloadSelectedGhana() {
     updateGhanaSelectCount();
     renderGhanaMusic(_ghanaSongs);
     loadHistoryIds();
-    setTimeout(() => switchTab('download'), 800);
 
     if (btn) {
         btn.disabled = _ghanaSelected.size === 0;

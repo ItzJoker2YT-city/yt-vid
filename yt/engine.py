@@ -3,6 +3,7 @@ Download engine module.
 Handles all YouTube downloading, conversion, and metadata operations using yt-dlp.
 """
 import os
+import re
 import json
 import uuid
 import shutil
@@ -58,6 +59,65 @@ if FFMPEG_LOCATION:
     logger.info("ffmpeg located at: %s", FFMPEG_LOCATION)
 else:
     logger.info("ffmpeg found on system PATH")
+
+
+def _apply_youtube_auth(opts, proxy=None):
+    """Inject YouTube cookies / PO-token runtime / proxy into yt-dlp opts.
+
+    - cookiefile: unlocks bot-checked (datacenter-flagged) IPs.
+    - js_runtimes: enables bgutil/yt-dlp-ejs PO-token providers for GVS/subs.
+    - proxy: routes YouTube traffic through a clean/residential IP. This is the
+      only thing that permanently beats YouTube's datacenter-IP bot block —
+      cookies from a residential browser get invalidated the moment Google sees
+      them used from a flagged IP.
+    All are optional; the app still works anonymously without them.
+    """
+    cookies_file = config.YTDLP_COOKIES_FILE
+    if cookies_file and os.path.isfile(cookies_file):
+        opts["cookiefile"] = cookies_file
+        logger.info("YouTube downloads using cookies file: %s", cookies_file)
+
+    js_runtime = config.YTDLP_JS_RUNTIME
+    if js_runtime and os.path.isfile(js_runtime):
+        opts["js_runtimes"] = {"deno": {"path": js_runtime}}
+
+    if proxy is None:
+        proxy = _next_proxy()
+    if proxy:
+        opts["proxy"] = proxy
+        logger.info("YouTube downloads using proxy: %s", _mask_proxy(proxy))
+    return opts
+
+
+def _mask_proxy(proxy):
+    """Hide any credentials embedded in a proxy URL when logging it."""
+    try:
+        return re.sub(r"(://[^:/@]+):[^@]+@", r"\1:***@", proxy)
+    except Exception:
+        return "(set)"
+
+
+# ─── Proxy rotation ──────────────────────────────────────────────────────────
+_proxy_rr_index = 0
+_proxy_rr_lock = threading.Lock()
+
+
+def _proxy_rotation():
+    """Parse YTDLP_PROXY (comma-separated) into a list of proxy strings."""
+    raw = getattr(config, "YTDLP_PROXY", "") or ""
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _next_proxy():
+    """Round-robin pick the next proxy in the rotation (None if none set)."""
+    proxies = _proxy_rotation()
+    if not proxies:
+        return None
+    global _proxy_rr_index
+    with _proxy_rr_lock:
+        p = proxies[_proxy_rr_index % len(proxies)]
+        _proxy_rr_index += 1
+    return p
 
 # Global registry of active downloads — keyed by download_id
 active_downloads = {}
@@ -230,7 +290,7 @@ def _build_ytdlp_opts(task):
             pp_args += ["-to", task.trim_end]
         opts["postprocessor_args"] = {"ffmpeg": pp_args}
 
-    return opts
+    return _apply_youtube_auth(opts)
 
 
 def _embed_metadata(filepath, info):
@@ -311,9 +371,52 @@ def _embed_mp3_metadata(filepath, title, artist, thumbnail="", album="Halmblog.c
 
 
 def _run_download(task):
-    """Execute a single-video download in a background thread."""
+    """Execute a single-video download in a background thread.
+
+    Tries each proxy in the rotation in order, failing over when a proxy is
+    bot-flagged, unreachable, or otherwise errors. Falls back to the direct
+    connection (the flagged server IP) only when no proxy is configured.
+    """
+    proxies = _proxy_rotation() or [None]
+    for attempt, proxy in enumerate(proxies):
+        try:
+            _run_download_once(task, proxy)
+            if task.status == "done":
+                return
+            # Route failed (bot-check, proxy dropped connection, etc.) — if
+            # more routes remain, fail over to the next one.
+            if attempt < len(proxies) - 1:
+                logger.warning(
+                    "Route %d failed (%s): %s; trying next route",
+                    attempt,
+                    _mask_proxy(proxy) if proxy else "direct",
+                    (task.error_message or "")[:120],
+                )
+                continue
+            return
+        except Exception as e:
+            task.status = "error"
+            task.error_message = _friendly_error(e)
+            logger.error("Download attempt %d failed for %s: %s", attempt, task.url, e)
+            if attempt >= len(proxies) - 1:
+                return
+
+    if task.status != "done":
+        task.status = "error"
+        task.error_message = task.error_message or "All download routes failed"
+
+
+def _run_download_once(task, proxy=None):
+    """Single download attempt through one proxy route (or the direct IP)."""
     try:
         opts = _build_ytdlp_opts(task)
+        # Surface real yt-dlp errors (e.g. YouTube bot checks) instead of the
+        # generic None return that `ignoreerrors` would produce.
+        opts["ignoreerrors"] = False
+        if proxy:
+            opts["proxy"] = proxy
+        else:
+            opts.pop("proxy", None)
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             # Extract info first to get title/thumbnail
@@ -421,6 +524,7 @@ def _run_playlist(url, output_dir, quality, parent_cancel, parent_pause, dl_type
     }
     if FFMPEG_LOCATION:
         probe_opts["ffmpeg_location"] = FFMPEG_LOCATION
+    _apply_youtube_auth(probe_opts)
 
     tasks = []
     try:
@@ -539,6 +643,7 @@ def probe_url(url):
     }
     if FFMPEG_LOCATION:
         opts["ffmpeg_location"] = FFMPEG_LOCATION
+    _apply_youtube_auth(opts)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -678,6 +783,12 @@ def remove_task(task_id):
 def _friendly_error(exc):
     """Map raw yt-dlp exceptions to user-friendly messages."""
     msg = str(exc).lower()
+    if "sign in to confirm you're not a bot" in msg or "not a bot" in msg:
+        return (
+            "YouTube is blocking this server's IP as a bot. Downloads need a "
+            "logged-in cookies file (see README: place cookies.txt in the project "
+            "folder)."
+        )
     if "video unavailable" in msg or "this video is not available" in msg:
         return "Video unavailable — it may be private or deleted."
     if "copyright" in msg:
@@ -721,6 +832,7 @@ def search_youtube(query, max_results=10):
         "extract_flat": True,   # <-- main speedup: no per-video page fetches
         "socket_timeout": 10,
     }
+    _apply_youtube_auth(opts)
 
     search_query = f"ytsearch{max_results}:{query}"
 
@@ -857,6 +969,7 @@ def search_artist_albums(artist, max_results=6):
         "extract_flat": True,
         "socket_timeout": 15,
     }
+    _apply_youtube_auth(opts_flat)
 
     seen_ids = set()
     results = []

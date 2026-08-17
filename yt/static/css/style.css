@@ -1273,6 +1273,72 @@ select.input-field {
     cursor: pointer;
 }
 
+.ghana-progress-wrap {
+    margin-top: 0.45rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+}
+.ghana-progress {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.22rem;
+    min-width: 0;
+}
+.ghana-progress-bar {
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+    position: relative;
+}
+.ghana-progress-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent), var(--success, #00d2a0));
+    transition: width 0.4s ease;
+    position: relative;
+    overflow: hidden;
+}
+.ghana-progress-fill::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+    transform: translateX(-100%);
+    animation: ghana-shimmer 1.4s infinite;
+}
+@keyframes ghana-shimmer {
+    100% { transform: translateX(100%); }
+}
+.ghana-progress-label {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.ghana-progress-error {
+    font-size: 0.75rem;
+    color: #ff5d5d;
+    word-break: break-word;
+}
+.ghana-save-btn {
+    font-size: 0.76rem;
+    padding: 0.3rem 0.5rem;
+    white-space: nowrap;
+    text-decoration: none;
+    flex-shrink: 0;
+}
+
+.search-progress-wrap {
+    margin-top: 0.45rem;
+    min-width: 0;
+}
+.search-progress-wrap .ghana-progress { flex-direction: column; }
+
 @media (max-width: 480px) {
     #ghana-music-grid { grid-template-columns: 1fr; }
     .ghana-song-card { flex-direction: column; }

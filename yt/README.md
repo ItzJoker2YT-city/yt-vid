@@ -230,10 +230,62 @@ The only state worth backing up (everything else is reproducible):
 | Symptom | Fix |
 |---|---|
 | `ERROR: Postprocessing: ffprobe and ffmpeg not found` | `sudo apt install -y ffmpeg`, then `sudo systemctl restart yt-mp3` |
+| `Sign in to confirm you're not a bot` on every YouTube download | Your server's IP is bot-flagged by YouTube (common on datacenter/VPS IPs). Drop a logged-in `cookies.txt` in the app folder — see [YouTube bot-check fix](#youtube-bot-check-fix) |
 | App won't start / port busy | `sudo systemctl status yt-mp3` and `journalctl -u yt-mp3 -f`; change `PORT` in `.env` |
 | Ghana feed empty on a fresh install | It self-builds in ~1–2 min — hit **🔄 Refresh**. If it stays empty, the VPS can't reach `halmblog.com` (firewall/egress) |
 | Server not responding after install | `curl http://localhost:5000/api/settings` on the VPS; check `systemctl status yt-mp3` |
 | Downloads run out of disk | Point `DOWNLOAD_DIR` at a bigger volume |
+
+---
+
+## YouTube bot-check fix
+
+YouTube bot-checks datacenter/VPS IPs, so downloads may fail with
+`Sign in to confirm you're not a bot`. PO-token providers alone do **not** clear
+this (verified) — the reliable fix is a logged-in session via cookies.
+
+> **Why cookies keep dying:** Google invalidates a logged-in session the moment
+> it sees it used from a flagged datacenter IP (session-hijacking protection).
+> So cookies work for a while, then "expire". The **permanent** fix is the proxy
+> below — a clean/residential IP means Google never flags the session in the
+> first place.
+
+### Option 1 — Proxy rotation (permanent fix, recommended)
+
+Route all YouTube traffic through clean/residential IPs. Cookies then stay
+valid indefinitely because the requests come from a trusted IP.
+
+Set the `YTDLP_PROXY` env var (comma-separated list) and restart the app:
+
+```bash
+# HTTP/S proxies (most providers) — comma-separated, tried in order:
+export YTDLP_PROXY="http://user:password@proxy1.example.com:8080,http://proxy2.example.com:3128"
+# SOCKS5 proxies also work:
+export YTDLP_PROXY="socks5://user:password@proxy.example.com:1080"
+sudo systemctl restart yt-mp3
+```
+
+The engine **round-robins** across the list and **fails over** to the next proxy
+whenever a route is bot-flagged, unreachable, or drops the connection — so a
+couple of flaky free proxies won't take the app down. The proxy applies to every
+yt-dlp call (search, probe, album scan, download). Leave it empty to connect
+directly.
+
+### Option 2 — Cookies (works until the session gets invalidated)
+
+1. Export your YouTube cookies in **Netscape format** (browser extension such as
+   "Get cookies.txt LOCALLY"). **Use a throwaway account** — downloads may risk
+   the account.
+2. Save the file as `cookies.txt` in the app folder (`yt/cookies.txt`), or set
+   the `YTDLP_COOKIES_FILE` env var to its path.
+3. Restart the app: `sudo systemctl restart yt-mp3`.
+
+The app picks the file up automatically on the next download — no code changes.
+When the file is absent, downloads still run anonymously.
+
+> Note: the datacenter-IP bot block cannot be beaten from the server's own IP —
+> cookies and PO tokens only work until Google re-flags the account. Only the
+> proxy (or moving the app to a residential connection) makes this permanent.
 
 ---
 
