@@ -80,6 +80,10 @@ def _apply_youtube_auth(opts, proxy=None):
     js_runtime = config.YTDLP_JS_RUNTIME
     if js_runtime and os.path.isfile(js_runtime):
         opts["js_runtimes"] = {"deno": {"path": js_runtime}}
+    elif shutil.which("deno"):
+        opts["js_runtimes"] = {"deno": {}}
+    elif shutil.which("node"):
+        opts["js_runtimes"] = {"node": {}}
 
     if proxy is None:
         proxy = _next_proxy()
@@ -409,6 +413,8 @@ def _run_download(task):
 def _run_download_once(task, proxy=None):
     """Single download attempt through one proxy route (or the direct IP)."""
     try:
+        task.error_message = ""
+        task.progress = 0
         opts = _build_ytdlp_opts(task)
         # Surface real yt-dlp errors (e.g. YouTube bot checks) instead of the
         # generic None return that `ignoreerrors` would produce.
@@ -419,8 +425,10 @@ def _run_download_once(task, proxy=None):
             opts.pop("proxy", None)
 
         with yt_dlp.YoutubeDL(opts) as ydl:
-            # Extract info first to get title/thumbnail
-            info = ydl.extract_info(task.url, download=False)
+            # One extraction performs the download and returns the metadata.
+            # A separate probe doubled YouTube requests and could be blocked
+            # before the actual download even started.
+            info = ydl.extract_info(task.url, download=True)
 
             if info is None:
                 raise Exception("Could not retrieve video information")
@@ -432,9 +440,6 @@ def _run_download_once(task, proxy=None):
             if duration_secs:
                 mins, secs = divmod(int(duration_secs), 60)
                 task.duration = f"{mins}:{secs:02d}"
-
-            # Perform download + conversion
-            info = ydl.extract_info(task.url, download=True)
 
             # Locate the output file
             raw_filename = ydl.prepare_filename(info)
@@ -483,18 +488,15 @@ def _run_download_once(task, proxy=None):
                         if newest:
                             expected_path = newest
 
-            # Fallback for weird extensions (e.g. yt-dlp produced original raw)
-            if (not os.path.exists(expected_path)) and os.path.exists(raw_filename):
-                expected_path = raw_filename
+            if not os.path.isfile(expected_path):
+                raise FileNotFoundError(
+                    f"Conversion did not produce the expected {expected_ext} file"
+                )
 
-            if os.path.exists(expected_path):
-                if task.dl_type == "audio":
-                    _embed_metadata(expected_path, info)
-                task.filepath = expected_path
-                task.filename = os.path.basename(expected_path)
-            else:
-                task.filepath = ""
-                task.filename = os.path.basename(raw_filename)
+            if task.dl_type == "audio":
+                _embed_metadata(expected_path, info)
+            task.filepath = expected_path
+            task.filename = os.path.basename(expected_path)
 
             task.status = "done"
             task.progress = 100
@@ -1153,6 +1155,9 @@ def _stream_mp3(task, resp, out_path):
     downloaded = 0
     start_time = _time.time()
     chunk_size = 131072  # 128 KiB
+    content_type = resp.headers.get("content-type", "").lower()
+    if "text/html" in content_type or "application/json" in content_type:
+        raise ValueError("The source returned a web page instead of an MP3")
 
     with open(out_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=chunk_size):
@@ -1164,6 +1169,8 @@ def _stream_mp3(task, resp, out_path):
 
             if not chunk:
                 continue
+            if downloaded == 0 and chunk.lstrip().lower().startswith((b"<html", b"<!doctype")):
+                raise ValueError("The source returned a web page instead of an MP3")
 
             f.write(chunk)
             downloaded += len(chunk)
@@ -1203,7 +1210,7 @@ def _run_direct_download(task):
         safe_name = "".join(c for c in raw_name if c.isalnum() or c in (" ", "-", "_")).strip()
         if not safe_name:
             safe_name = "ghana_song"
-        out_path = os.path.join(out_dir, f"{safe_name}.mp3")
+        out_path = os.path.join(out_dir, f"{safe_name}-{task.id}.mp3")
 
         headers = {
             "User-Agent": (
@@ -1250,6 +1257,11 @@ def _run_direct_download(task):
         logger.info("Direct download complete: %s → %s", task.title, task.filename)
 
     except Exception as e:
+        if "out_path" in locals() and os.path.isfile(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                logger.warning("Could not clean up incomplete MP3: %s", out_path)
         task.status = "error"
         task.error_message = _friendly_error(e)
         logger.error("Direct download failed for %s: %s", task.url, e)

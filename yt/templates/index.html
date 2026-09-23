@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Download YouTube videos as high-quality MP3 files with batch support, playlist downloads, and metadata management.">
-    <title>YT-MP3 — YouTube to MP3 Downloader</title>
+    <title>YT Studio — Your media workspace</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=2">
 </head>
 <body>
     <!-- Toast notification container -->
@@ -16,59 +16,64 @@
         <!-- ═══ Header ═══ -->
         <header class="app-header">
             <div class="app-logo">
-                <div class="icon">🎵</div>
-                <h1>YT-MP3</h1>
+                <div class="icon" aria-hidden="true">▶</div>
+                <h1>YT Studio<span class="logo-dot">.</span></h1>
             </div>
-            <p class="subtitle">Download YouTube audio as high-quality MP3 files</p>
+            <div class="header-right">
+                <span class="header-caption">Your media workspace</span>
+                <span class="connection-pill" id="connection-status"><span class="connection-dot"></span> Checking connection</span>
+            </div>
         </header>
 
-        <!-- Advertisement -->
-        <div style="text-align: center; margin-bottom: 1.5rem;">
-            <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3900778923660164"
-                 crossorigin="anonymous"></script>
-            <!-- as -->
-            <ins class="adsbygoogle"
-                 style="display:inline-block;width:728px;height:90px"
-                 data-ad-client="ca-pub-3900778923660164"
-                 data-ad-slot="3859145104"></ins>
-            <script>
-                 (adsbygoogle = window.adsbygoogle || []).push({});
-            </script>
-        </div>
-
         <!-- ═══ Navigation ═══ -->
-        <nav class="nav-tabs" role="tablist">
-            <button class="nav-tab active" data-tab="download" role="tab">
-                <span class="tab-icon">⬇️</span>
-                <span class="tab-label">Download</span>
+        <nav class="nav-tabs" role="tablist" aria-label="Workspace sections">
+            <button class="nav-tab active" data-tab="download" role="tab" aria-selected="true">
+                <span class="tab-icon" aria-hidden="true">↓</span>
+                <span class="tab-label">Downloader</span>
             </button>
-            <button class="nav-tab" data-tab="search" role="tab">
-                <span class="tab-icon">🔍</span>
-                <span class="tab-label">Search</span>
+            <button class="nav-tab" data-tab="search" role="tab" aria-selected="false">
+                <span class="tab-icon" aria-hidden="true">⌕</span>
+                <span class="tab-label">Discover</span>
             </button>
-            <button class="nav-tab" data-tab="ghana-music" role="tab">
-                <span class="tab-icon">🇬🇭</span>
+            <button class="nav-tab" data-tab="ghana-music" role="tab" aria-selected="false">
+                <span class="tab-icon" aria-hidden="true">♫</span>
                 <span class="tab-label">Ghana Music</span>
             </button>
-            <button class="nav-tab" data-tab="history" role="tab">
-                <span class="tab-icon">📋</span>
+            <button class="nav-tab" data-tab="history" role="tab" aria-selected="false">
+                <span class="tab-icon" aria-hidden="true">◷</span>
                 <span class="tab-label">History</span>
             </button>
         </nav>
 
         <!-- ═══ Download Panel ═══ -->
         <section class="tab-panel active" id="panel-download" role="tabpanel">
-            <div class="card">
-                <h2 class="card-title"><span class="icon">🔗</span> Add Downloads</h2>
+            <div class="download-intro">
+                <div>
+                    <p class="eyebrow">YOUR DOWNLOAD DESK</p>
+                    <h2>Your media.<br><span>One place.</span></h2>
+                    <p>One link or a whole playlist. Choose your format, set your quality, and follow every download in one place.</p>
+                </div>
+                <div class="intro-mark" aria-hidden="true"><span>↓</span></div>
+            </div>
+            <div class="availability-note" role="status">
+                <span class="availability-icon" aria-hidden="true">!</span>
+                <span><strong>YouTube access on this server is limited.</strong> YouTube may block downloads from this server's IP. Direct Ghana Music MP3 links can still work; a working outbound connection is needed for YouTube.</span>
+            </div>
+            <div class="card composer-card">
+                <div class="section-heading">
+                    <div><span class="section-kicker">01 / CREATE</span><h2 class="card-title">New download</h2></div>
+                    <span class="section-help">Paste • choose • download</span>
+                </div>
                 <form id="download-form">
                     <div class="input-group">
-                        <label for="url-input">YouTube URLs</label>
+                        <div class="label-line"><label for="url-input">YouTube links</label><button type="button" class="text-button" id="paste-link-btn">Paste from clipboard</button></div>
                         <textarea class="input-field" id="url-input"
-                            placeholder="Paste one or more YouTube URLs (one per line)&#10;&#10;Examples:&#10;https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://www.youtube.com/playlist?list=PLrAXtmEr..."></textarea>
+                            placeholder="Paste a video or playlist link here&#10;Add more links on separate lines"></textarea>
+                        <div class="input-foot"><span>youtube.com · youtu.be · playlists</span><span id="link-count" aria-live="polite">0 links</span></div>
                     </div>
 
-                    <div class="inline-row">
-                        <div style="display:flex; gap:1rem;">
+                    <div class="inline-row format-row">
+                        <div class="format-fields">
                             <div class="input-group" style="flex:1">
                                 <label for="dl-type">Format</label>
                                 <select id="dl-type" class="input-field" onchange="handleTypeChange()">
@@ -85,57 +90,54 @@
                                 </select>
                             </div>
                         </div>
-                        <div class="input-group">
-                            <label for="trim-start">Trim Start</label>
-                            <input type="text" class="input-field" id="trim-start"
-                                   placeholder="e.g. 00:30 or 1:05">
-                        </div>
-                        <div class="input-group">
-                            <label for="trim-end">Trim End</label>
-                            <input type="text" class="input-field" id="trim-end"
-                                   placeholder="e.g. 3:45 or 04:00">
-                        </div>
                     </div>
-
-                    <button type="submit" class="btn btn-primary btn-full" id="submit-btn">
-                        ⬇️ Download MP3
-                    </button>
+                    <details class="advanced-options">
+                        <summary>Advanced options <span>Optional trimming</span></summary>
+                        <div class="trim-fields">
+                            <div class="input-group"><label for="trim-start">Start at</label><input type="text" class="input-field" id="trim-start" placeholder="e.g. 00:30"></div>
+                            <div class="input-group"><label for="trim-end">End at</label><input type="text" class="input-field" id="trim-end" placeholder="e.g. 03:45"></div>
+                        </div>
+                    </details>
+                    <div class="composer-actions">
+                        <span>Downloads are processed by this server.</span>
+                        <button type="submit" class="btn btn-primary" id="submit-btn">↓ Download MP3</button>
+                    </div>
                 </form>
             </div>
 
-            <!-- Advertisement (dd) -->
-            <div style="text-align: center; margin-bottom: 1.5rem;">
-                <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3900778923660164"
-                     crossorigin="anonymous"></script>
-                <!-- dd -->
-                <ins class="adsbygoogle"
-                     style="display:inline-block;width:728px;height:90px"
-                     data-ad-client="ca-pub-3900778923660164"
-                     data-ad-slot="5039299178"></ins>
-                <script>
-                     (adsbygoogle = window.adsbygoogle || []).push({});
-                </script>
-            </div>
-
             <!-- Download Queue -->
-            <div class="card">
+            <div class="card queue-card">
                 <div class="queue-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.25rem;">
-                    <h2 class="card-title" style="margin-bottom:0"><span class="icon">📥</span> Download Queue</h2>
+                    <div><span class="section-kicker">02 / TRACK</span><h2 class="card-title" style="margin-bottom:0">Your queue <span class="queue-count" id="queue-count">0</span></h2></div>
                     <div id="queue-actions">
                         <!-- Global actions like Download All ZIP -->
                     </div>
                 </div>
                 <div id="download-queue">
                     <div class="queue-empty">
-                        <div class="empty-icon">📭</div>
-                        <p>No active downloads — paste a YouTube URL above to get started.</p>
+                        <div class="empty-icon" aria-hidden="true">↓</div>
+                        <p><strong>Your queue is clear</strong><br>Paste a link above to start a download.</p>
                     </div>
                 </div>
             </div>
         </section>
 
         <!-- ═══ Search Panel ═══ -->
-        <section class="tab-panel" id="panel-search" role="tabpanel">
+        <section class="tab-panel is-blocked" id="panel-search" role="tabpanel">
+
+            <!-- Blocked overlay: Discover relies on YouTube, disabled for now -->
+            <div class="block-overlay">
+                <div class="block-overlay-card">
+                    <div class="block-overlay-icon">🔒</div>
+                    <h2 class="block-overlay-title">Discover is turned off</h2>
+                    <p class="block-overlay-text">
+                        This page runs on YouTube, which isn't sourcing reliably right now —
+                        so it's blocked for a reason. We'll switch it back on once the
+                        source is stable. In the meantime, use <b>Downloader</b> or
+                        <b>Ghana Music</b>.
+                    </p>
+                </div>
+            </div>
 
             <!-- Ghana Artists Browser -->
             <div class="card" id="artists-card">
@@ -175,20 +177,6 @@
                 </div>
             </div>
 
-            <!-- Autorelaxed Advertisement -->
-            <div style="margin-bottom: 1.5rem;">
-                <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3900778923660164"
-                     crossorigin="anonymous"></script>
-                <ins class="adsbygoogle"
-                     style="display:block"
-                     data-ad-format="autorelaxed"
-                     data-ad-client="ca-pub-3900778923660164"
-                     data-ad-slot="8753130169"></ins>
-                <script>
-                     (adsbygoogle = window.adsbygoogle || []).push({});
-                </script>
-            </div>
-
             <div id="search-toolbar" style="display:none; margin-bottom:1rem; flex-wrap:wrap; align-items:center; gap:0.75rem;">
                 <label class="latest-toggle" title="Hide videos longer than 15 minutes">
                     <input type="checkbox" id="search-songs-only" onchange="reRenderSearch()">
@@ -222,26 +210,36 @@
                 <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:1.25rem; flex-wrap:wrap; gap:0.75rem;">
                     <h2 class="card-title" style="margin-bottom:0"><span class="icon">🇬🇭</span> Ghana Music <span style="font-weight:400;font-size:0.85rem;color:var(--text-muted)">from Halmblog.com</span></h2>
                     <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
-                        <button class="btn btn-sm btn-secondary" id="ghana-refresh-btn" onclick="loadGhanaMusic()">🔄 Refresh</button>
+                        <button class="btn btn-sm btn-secondary" id="ghana-refresh-btn" onclick="refreshGhanaMusic()">🔄 Check for new songs</button>
                         <button class="btn btn-sm btn-success" id="ghana-download-selected-btn" onclick="downloadSelectedGhana()" disabled>⬇️ Download Selected (<span id="ghana-selected-count">0</span>)</button>
                     </div>
                 </div>
                 <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem">
-                    Browse the latest Ghanaian songs. Select multiple tracks and download them as MP3 at 320kbps.
+                    Browse the local Ghanaian music archive. Direct MP3 quality depends on the source file.
                 </p>
 
                 <!-- Search bar -->
                 <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; margin-bottom:1rem;">
                     <input type="text" class="input-field" id="ghana-search-input"
-                           placeholder="🔍 Super Search by artist or song title..." style="flex:1; min-width:200px; padding:0.5rem 0.85rem; font-size:0.85rem;"
+                           placeholder="🔍 Search the archive by artist or title..." style="flex:1; min-width:200px; padding:0.5rem 0.85rem; font-size:0.85rem;"
                            onkeydown="if(event.key==='Enter')doGhanaSearch()">
-                    <button class="btn btn-sm btn-primary" id="ghana-search-btn" onclick="doGhanaSearch()">⚡ Super Search</button>
+                    <button class="btn btn-sm btn-primary" id="ghana-search-btn" onclick="doGhanaSearch()">Search archive</button>
                     <button class="btn btn-sm btn-secondary" onclick="document.getElementById('ghana-search-input').value=''; loadGhanaMusic();">Clear</button>
                 </div>
-                <!-- Bulk select controls -->
+                <!-- Bulk select + view controls -->
                 <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; margin-bottom:1rem;">
                     <button class="btn btn-sm btn-secondary" onclick="toggleSelectAllGhana(true)">☑️ Select All</button>
                     <button class="btn btn-sm btn-secondary" onclick="toggleSelectAllGhana(false)">☐ Deselect All</button>
+                    <label style="display:flex; align-items:center; gap:0.4rem; margin-left:auto; font-size:0.82rem; color:var(--text-secondary);">
+                        Show per page
+                        <select id="ghana-page-size" class="input-field" style="padding:0.35rem 0.5rem; font-size:0.82rem; width:auto;"
+                                onchange="changeGhanaPageSize(this.value)">
+                            <option value="5">5</option>
+                            <option value="20" selected>20</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                    </label>
                 </div>
 
                 <div id="ghana-music-grid">

@@ -193,10 +193,10 @@ Or skip nginx entirely and use a **Cloudflare Tunnel** pointing to `http://127.0
 
 No setup needed — it's fully automatic:
 
-1. **On first start** the app scrapes the Halmblog.com Ghana Music listing in the background and builds a local cache (`data/ghana_music.json`). The repo ships a pre-built cache with ~2,000 songs, so the feed is populated **immediately** even before the first scrape finishes.
+1. **On first start** the app scrapes the Halmblog.com Ghana Music listing in the background and builds a local SQLite cache (`data/ghana_music.db`). The feed may be empty until this first build finishes.
 2. **Auto-update (live)** — every ~30–60 s the app re-checks page 1 and pins any newly posted songs to the top of the feed (the "auto-updating live" dot).
 3. **Deep cache** — the **"➕ Load More Pages (Deep Cache)"** button crawls deeper into the archive in the background and grows the cache page-by-page (progress shown live, resume position persisted as `max_page`).
-4. **MP3 links** — a background filler visits song pages and attaches direct `.mp3` URLs over time; songs without a link yet still stream/download via the detail scrape.
+4. **Search and MP3 links** — search uses the cached archive for fast results. A background filler rotates through song pages to attach direct `.mp3` URLs over time. For songs without a link, **Find MP3** checks the source page; it reports when no direct file is available rather than silently falling back to YouTube.
 
 > 🛡️ The scraper is hardened for Halmblog.com's bot protection (browser-like headers, no `Accept-Encoding: br`, automatic retry fallback) — scraping works from cloud/VPS IPs just like it does locally.
 
@@ -310,6 +310,6 @@ yt/
 
 - ⬇️ **Download** — single URLs, batch, playlists; MP3 128–320 kbps or MP4 480p–1080p; trim start/end
 - 🔍 **Search** — YouTube search, artist/album lookup, Ghana artist browser
-- 🇬🇭 **Ghana Music** — auto-updating feed from Halmblog.com with super search and deep cache
+- 🇬🇭 **Ghana Music** — periodically refreshed feed from Halmblog.com with fast archive search and deep cache
 - 📥 **Queue** — pause/resume/cancel, download all as ZIP
 - 📋 **History** — persistent download history with re-download

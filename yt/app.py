@@ -11,6 +11,7 @@ import mimetypes
 import threading
 import time
 from urllib.parse import quote as _url_quote
+from urllib.parse import urlsplit
 from logging.handlers import RotatingFileHandler
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
@@ -18,7 +19,7 @@ from flask import Flask, render_template, request, jsonify, send_file, Response
 import config
 import engine
 from halmblog import (
-    get_ghana_songs_cached, search_cached_songs, super_search, get_cached_songs,
+    get_ghana_songs_cached, search_cached_songs, get_cached_songs,
     get_total_pages, get_total_songs,
     start_background_updater, build_cache, fill_missing_mp3s, resume_deep_cache,
 )
@@ -295,46 +296,18 @@ def api_ghana_music_info():
         return jsonify({"error": str(e)}), 500
 
 
-# Temporary in-memory cache for paginated search results
-_search_result_cache = {}
-_SEARCH_CACHE_TTL = 600  # 10 minutes
-
 @app.route("/api/ghana-music/search", methods=["POST"])
 def api_ghana_music_search():
-    """Advanced search: cache first, then scrape pages on-the-fly if needed.
-    Supports pagination via page/limit query params."""
+    """Search the local archive without triggering a crawl for every query."""
     data = request.get_json(silent=True) or {}
-    query = data.get("query", "").strip()
-    page = request.args.get("page", 1, type=int)
-    limit = request.args.get("limit", 20, type=int)
-
-    if not query:
-        return jsonify({"songs": get_cached_songs(), "total_results": len(get_cached_songs()), "query": ""})
-
-    cache_key = query.lower().strip()
-
+    query = str(data.get("query") or "").strip()[:120]
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
     try:
-        # Use super_search for blazing speed (80 workers)
-        results = super_search(query)
-        _search_result_cache[cache_key] = {"results": results, "ts": __import__("time").time()}
-
+        results = search_cached_songs(query)
         start = (page - 1) * limit
-        page_results = results[start : start + limit]
-
         return jsonify({
-            "songs": [
-                {
-                    "title": s.get("title", ""),
-                    "artist": s.get("artist", ""),
-                    "page_url": s.get("page_url", ""),
-                    "thumbnail": s.get("thumbnail", ""),
-                    "date": s.get("date", ""),
-                    "mp3_url": s.get("mp3_url"),
-                    "mp3_url_fallback": s.get("mp3_url_fallback"),
-                    "has_mp3": bool(s.get("mp3_url")),
-                }
-                for s in page_results
-            ],
+            "songs": [_ghana_song_result(s) for s in results[start:start + limit]],
             "total_results": len(results),
             "query": query,
             "page": page,
@@ -347,48 +320,30 @@ def api_ghana_music_search():
 
 @app.route("/api/ghana-music/search-next", methods=["POST"])
 def api_ghana_music_search_next():
-    """Return the next page of a previously-run search (fast, from memory)."""
+    """Compatibility endpoint: same cache-backed pagination as search."""
     data = request.get_json(silent=True) or {}
-    query = data.get("query", "").strip()
-    page = data.get("page", 1)
-    limit = data.get("limit", 20)
-    if not query:
-        return jsonify({"songs": [], "total_results": 0})
-
-    cache_key = query.lower().strip()
-    cached = _search_result_cache.get(cache_key)
-    if not cached or (__import__("time").time() - cached["ts"]) > _SEARCH_CACHE_TTL:
-        # Stale or missing — fall back to re-searching
-        try:
-            results = super_search(query)
-            _search_result_cache[cache_key] = {"results": results, "ts": __import__("time").time()}
-        except Exception as e:
-            app.logger.error("Ghana music search-next failed: %s", e)
-            return jsonify({"error": str(e)}), 500
-    else:
-        results = cached["results"]
-
+    query = str(data.get("query") or "").strip()[:120]
+    try:
+        page = max(1, int(data.get("page") or 1))
+        limit = min(50, max(1, int(data.get("limit") or 20)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid page or limit"}), 400
+    results = search_cached_songs(query) if query else []
     start = (page - 1) * limit
-    page_results = results[start : start + limit]
     return jsonify({
-        "songs": [
-            {
-                "title": s.get("title", ""),
-                "artist": s.get("artist", ""),
-                "page_url": s.get("page_url", ""),
-                "thumbnail": s.get("thumbnail", ""),
-                "date": s.get("date", ""),
-                "mp3_url": s.get("mp3_url"),
-                "mp3_url_fallback": s.get("mp3_url_fallback"),
-                "has_mp3": bool(s.get("mp3_url")),
-            }
-            for s in page_results
-        ],
+        "songs": [_ghana_song_result(s) for s in results[start:start + limit]],
         "total_results": len(results),
         "query": query,
         "page": page,
         "limit": limit,
     })
+
+def _ghana_song_result(song):
+    """Return only public fields, matching the regular feed endpoint."""
+    return {
+        key: song.get(key) for key in
+        ("title", "artist", "page_url", "thumbnail", "date", "mp3_url", "mp3_url_fallback")
+    } | {"has_mp3": bool(song.get("mp3_url"))}
 
 
 @app.route("/api/ghana-music/deep-cache", methods=["POST"])
@@ -413,8 +368,8 @@ def api_ghana_music_detail():
     """Scrape a specific Halmblog song page for MP3 link."""
     data = request.get_json(silent=True) or {}
     page_url = data.get("url", "").strip()
-    if not page_url:
-        return jsonify({"error": "No URL provided"}), 400
+    if not _is_ghana_url(page_url):
+        return jsonify({"error": "Enter a Ghana Music source link"}), 400
     try:
         from halmblog import scrape_song_page
         detail = scrape_song_page(page_url)
@@ -436,11 +391,15 @@ def api_ghana_music_download():
     title = data.get("title", "").strip()
     artist = data.get("artist", "").strip()
     thumbnail = data.get("thumbnail", "").strip()
-    quality = data.get("quality", config.DEFAULT_QUALITY)
-    output_dir = data.get("output_dir", config.DEFAULT_DOWNLOAD_DIR)
+    quality = "source"  # Direct MP3 files are saved as-is, not transcoded.
+    output_dir = config.DEFAULT_DOWNLOAD_DIR
 
-    if not mp3_url:
-        return jsonify({"error": "No MP3 URL provided"}), 400
+    if not _is_ghana_url(mp3_url, mp3=True):
+        return jsonify({"error": "Invalid Ghana Music MP3 link"}), 400
+    if fallback_url and not _is_ghana_url(fallback_url, mp3=True, archive=True):
+        return jsonify({"error": "Invalid fallback MP3 link"}), 400
+    if thumbnail and not _is_ghana_url(thumbnail):
+        thumbnail = ""
 
     try:
         tasks = engine.start_direct_download(
@@ -457,6 +416,20 @@ def api_ghana_music_download():
     except Exception as e:
         app.logger.error("Ghana music direct download failed: %s", e)
         return jsonify({"error": str(e)}), 500
+
+def _is_ghana_url(value, mp3=False, archive=False):
+    """Only accept links to the source archive, not arbitrary server URLs."""
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or parsed.username or parsed.password:
+            return False
+        if parsed.hostname in ("www.halmblog.com", "halmblog.com"):
+            return not mp3 or parsed.path.lower().endswith(".mp3")
+        return bool(archive and mp3 and parsed.hostname == "web.archive.org"
+                    and "halmblog.com/" in parsed.path.lower()
+                    and ".mp3" in parsed.path.lower())
+    except (TypeError, ValueError):
+        return False
 
 
 @app.route("/api/ghana-music/youtube-download", methods=["POST"])

@@ -36,6 +36,7 @@ _PAGE_CACHE_TTL = 60
 # background MP3 filler can back off instead of hammering a blocked endpoint.
 _mp3_fail_streak = 0
 _MP3_BLOCK_THRESHOLD = 6
+_mp3_fill_cursor = 0
 
 # True when the most recent page fetch fell back to a Wayback Machine capture
 # (i.e. halmblog's WAF is blocking our IP) — used to slow the MP3 filler and
@@ -318,6 +319,27 @@ def _load_cache() -> dict:
 
 def _save_cache(data: dict):
     try:
+        # Crawlers fetch pages concurrently. Merge at save time so an older
+        # snapshot cannot erase newly discovered songs or direct MP3 links.
+        current = cache_db.load_cache()
+        current_by_url = _by_url(current)
+        incoming = []
+        seen = set()
+        for song in data.get("songs", []):
+            url = song.get("page_url")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            old = current_by_url.get(url, {})
+            incoming.append({
+                **song,
+                "mp3_url": song.get("mp3_url") or old.get("mp3_url"),
+                "mp3_url_fallback": song.get("mp3_url_fallback") or old.get("mp3_url_fallback"),
+                "thumbnail": song.get("thumbnail") or old.get("thumbnail", ""),
+            })
+        incoming.extend(song for url, song in current_by_url.items() if url not in seen)
+        data["songs"] = incoming
+        data["max_page"] = max(int(data.get("max_page") or 1), int(current.get("max_page") or 1))
         cache_db.save_cache(data)
     except Exception as e:
         logger.warning("Failed to save cache to SQLite: %s", e)
@@ -544,6 +566,7 @@ def build_cache(max_pages: int = 2) -> dict:
     all_songs = list(cache.get("songs", []))
     new_cnt = 0
     updated_cnt = 0
+    listing_order = []
 
     for p in range(1, max_pages + 1):
         listings = scrape_listing(page=p)
@@ -551,6 +574,7 @@ def build_cache(max_pages: int = 2) -> dict:
             break
         for item in listings:
             key = item["page_url"]
+            listing_order.append(key)
             if key not in existing:
                 # Brand new — insert at TOP (most recent)
                 all_songs.insert(0, {
@@ -578,7 +602,10 @@ def build_cache(max_pages: int = 2) -> dict:
                         updated_cnt += 1
                         break
 
-    cache["songs"] = all_songs
+    by_url = _by_url({"songs": all_songs})
+    seen = set(listing_order)
+    cache["songs"] = [by_url[url] for url in listing_order if url in by_url]
+    cache["songs"].extend(song for song in all_songs if song["page_url"] not in seen)
     cache["last_updated"] = datetime.now().isoformat()
     with _CACHE_LOCK:
         _save_cache(cache)
@@ -589,10 +616,18 @@ def build_cache(max_pages: int = 2) -> dict:
 def fill_missing_mp3s(limit: int = 50) -> int:
     """Background task: visit song pages without MP3 and extract links.
     Returns number of MP3s found."""
-    global _mp3_fail_streak
+    global _mp3_fail_streak, _mp3_fill_cursor
     cache = _load_cache()
     filled = 0
-    pending = [s for s in cache.get("songs", []) if not s.get("mp3_url")][:limit]
+    missing = [s for s in cache.get("songs", []) if not s.get("mp3_url")]
+    if not missing:
+        return 0
+    # Rotate through the archive instead of retrying the same first N
+    # unavailable songs forever.
+    start = _mp3_fill_cursor % len(missing)
+    pending = (missing[start:] + missing[:start])[:limit]
+    _mp3_fill_cursor = (start + len(pending)) % len(missing)
+    found = {}
 
     for s in pending:
         try:
@@ -603,10 +638,7 @@ def fill_missing_mp3s(limit: int = 50) -> int:
             else:
                 _mp3_fail_streak = 0
                 if details.get("mp3_url"):
-                    s["mp3_url"] = details["mp3_url"]
-                    s["mp3_url_fallback"] = details.get("mp3_url_fallback")
-                    s["has_mp3"] = True
-                    s["thumbnail"] = details.get("thumbnail") or s.get("thumbnail", "")
+                    found[s["page_url"]] = details
                     filled += 1
             # Be gentle — the WAF rate-limits aggressive crawlers, and when the
             # site is IP-blocked (fetches going via Wayback SPN) pace much slower.
@@ -615,9 +647,17 @@ def fill_missing_mp3s(limit: int = 50) -> int:
             _mp3_fail_streak += 1
             logger.debug("MP3 fill failed for %s: %s", s["page_url"], e)
 
-    if filled > 0:
+    if found:
         with _CACHE_LOCK:
-            _save_cache(cache)
+            latest = _load_cache()
+            for song in latest.get("songs", []):
+                details = found.get(song["page_url"])
+                if details:
+                    song["mp3_url"] = details["mp3_url"]
+                    song["mp3_url_fallback"] = details.get("mp3_url_fallback")
+                    song["has_mp3"] = True
+                    song["thumbnail"] = details.get("thumbnail") or song.get("thumbnail", "")
+            _save_cache(latest)
     logger.info("MP3 fill pass complete: %d/%d found (block streak %d)", filled, len(pending), _mp3_fail_streak)
     return filled
 
@@ -874,12 +914,19 @@ def super_search(query: str,
 # ─── Async cache kickoff (never blocks HTTP thread) ───────────────────────────
 def _kickoff_cache_build(max_pages: int = 3):
     """Start a background thread to build the cache — returns instantly."""
+    global _BACKGROUND_THREAD
     def _builder():
         try:
             build_cache(max_pages=max_pages)
         except Exception as e:
             logger.info("Background cache build failed (will retry): %s", e)
-    threading.Thread(target=_builder, daemon=True, name="async-cache-build").start()
+    with _CACHE_LOCK:
+        if _BACKGROUND_THREAD and _BACKGROUND_THREAD.is_alive():
+            return
+        _BACKGROUND_THREAD = threading.Thread(
+            target=_builder, daemon=True, name="async-cache-build"
+        )
+        _BACKGROUND_THREAD.start()
 
 
 #  Allow callers to point at super_search when they want speed

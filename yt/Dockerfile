@@ -7,6 +7,9 @@
 
 FROM python:3.11-slim
 
+# yt-dlp needs a modern JavaScript runtime for current YouTube formats.
+COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+
 # ffmpeg is REQUIRED: MP3 conversion, trimming, and merged video downloads
 # all depend on it. (yt-dlp raises "ffprobe and ffmpeg not found" without it.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
