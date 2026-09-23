@@ -1,0 +1,14 @@
+# ── Local environment & installer output ────────────────────────────
+.venv/
+venv/
+run.sh
+
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── Runtime / local artifacts ───────────────────────────────────────
+*.log
+*.pid
+test-downloads/
+downloads/
