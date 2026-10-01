@@ -39,7 +39,8 @@ LEGACY_HISTORY_JSON = os.path.join(DATA_DIR, "history.json")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
-HISTORY_LIMIT = 500
+HISTORY_LIMIT = 500          # newest entries kept per visitor
+HISTORY_GLOBAL_LIMIT = 20000 # hard cap on the whole history table
 
 _SONG_COLUMNS = (
     "page_url", "position", "title", "artist", "thumbnail", "date",
@@ -74,6 +75,8 @@ CREATE TABLE IF NOT EXISTS history (
     entry         JSONB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_history_downloaded_at ON history(downloaded_at DESC);
+ALTER TABLE history ADD COLUMN IF NOT EXISTS client_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_history_client ON history(client_id, downloaded_at DESC);
 """
 
 _pool = None
@@ -183,14 +186,14 @@ def _pg_write_cache(cur, data: dict) -> None:
     cur.execute(upsert, ("max_page", str(data.get("max_page") or 1)))
 
 
-def _pg_insert_history(cur, entry: dict) -> None:
+def _pg_insert_history(cur, entry: dict, client_id: str = "") -> None:
     from psycopg.types.json import Jsonb
     cur.execute(
-        "INSERT INTO history (id, downloaded_at, entry) VALUES (%s, %s, %s) "
+        "INSERT INTO history (id, downloaded_at, entry, client_id) VALUES (%s, %s, %s, %s) "
         "ON CONFLICT (id) DO UPDATE SET downloaded_at = EXCLUDED.downloaded_at, "
-        "entry = EXCLUDED.entry",
+        "entry = EXCLUDED.entry, client_id = EXCLUDED.client_id",
         (str(entry.get("id") or entry.get("downloaded_at") or os.urandom(8).hex()),
-         entry.get("downloaded_at", "") or "", Jsonb(entry)),
+         entry.get("downloaded_at", "") or "", Jsonb(entry), client_id or ""),
     )
 
 
@@ -296,9 +299,22 @@ def _json_history_load() -> list:
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────
+# The song list is read on almost every request, so it is kept in memory and
+# only read from the database once per process. Writes go to both.
 
-def load_cache() -> dict:
-    """Return {last_updated, max_page, songs} mirroring the legacy JSON shape."""
+_mem_cache = None
+_mem_lock = threading.Lock()
+
+
+def _copy_cache(data: dict) -> dict:
+    return {
+        "last_updated": data.get("last_updated"),
+        "max_page": data.get("max_page"),
+        "songs": [dict(s) for s in data.get("songs", [])],
+    }
+
+
+def _db_load_cache() -> dict:
     if not USE_POSTGRES:
         return _sqlite_load_cache()
     with _pg_pool().connection() as conn:
@@ -312,53 +328,96 @@ def load_cache() -> dict:
     }
 
 
+def load_cache() -> dict:
+    """Return {last_updated, max_page, songs} mirroring the legacy JSON shape."""
+    global _mem_cache
+    if _mem_cache is None:
+        with _mem_lock:
+            if _mem_cache is None:
+                _mem_cache = _db_load_cache()
+                logger.info("Loaded %d songs from the database", len(_mem_cache["songs"]))
+    return _copy_cache(_mem_cache)
+
+
+def warm_cache() -> int:
+    """Load the song list into memory (call at startup)."""
+    return len(load_cache()["songs"])
+
+
 def save_cache(data: dict) -> None:
     """Persist the full cache. Song order is preserved via the position column."""
+    global _mem_cache
+    snapshot = _copy_cache(data)
+    seen, songs = set(), []
+    for s in snapshot["songs"]:
+        url = s.get("page_url")
+        if url and url not in seen:
+            seen.add(url)
+            s["has_mp3"] = bool(s.get("has_mp3") or s.get("mp3_url"))
+            songs.append(s)
+    snapshot["songs"] = songs
     if not USE_POSTGRES:
-        return _sqlite_save_cache(data)
-    with _pg_pool().connection() as conn:
-        with conn.transaction():
-            with conn.cursor() as cur:
-                _pg_write_cache(cur, data)
+        _sqlite_save_cache(data)
+    else:
+        with _pg_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _pg_write_cache(cur, data)
+    with _mem_lock:
+        _mem_cache = snapshot
 
 
-def add_history_entry(entry: dict) -> None:
-    """Add a completed download to history, keeping the newest HISTORY_LIMIT."""
+def add_history_entry(entry: dict, client_id: str = "") -> None:
+    """Add a completed download to this visitor's history."""
     if not USE_POSTGRES:
         with _history_lock:
             history = _json_history_load()
-            history.insert(0, entry)
+            history.insert(0, {**entry, "_client": client_id or ""})
+            mine = [h for h in history if h.get("_client", "") == (client_id or "")][:HISTORY_LIMIT]
+            others = [h for h in history if h.get("_client", "") != (client_id or "")]
             os.makedirs(DATA_DIR, exist_ok=True)
             with open(LEGACY_HISTORY_JSON, "w", encoding="utf-8") as f:
-                json.dump(history[:HISTORY_LIMIT], f, indent=2, ensure_ascii=False)
+                json.dump((mine + others)[:HISTORY_GLOBAL_LIMIT], f, indent=2, ensure_ascii=False)
         return
     with _pg_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
-                _pg_insert_history(cur, entry)
+                _pg_insert_history(cur, entry, client_id)
+                cur.execute(
+                    "DELETE FROM history WHERE client_id = %s AND id NOT IN ("
+                    "SELECT id FROM history WHERE client_id = %s "
+                    "ORDER BY downloaded_at DESC LIMIT %s)",
+                    (client_id or "", client_id or "", HISTORY_LIMIT),
+                )
                 cur.execute(
                     "DELETE FROM history WHERE id NOT IN ("
                     "SELECT id FROM history ORDER BY downloaded_at DESC LIMIT %s)",
-                    (HISTORY_LIMIT,),
+                    (HISTORY_GLOBAL_LIMIT,),
                 )
 
 
-def get_history() -> list:
-    """Return download history, newest first."""
+def get_history(client_id: str = "") -> list:
+    """Return this visitor's download history, newest first."""
     if not USE_POSTGRES:
-        return _json_history_load()
+        return [{k: v for k, v in h.items() if k != "_client"}
+                for h in _json_history_load() if h.get("_client", "") == (client_id or "")]
     with _pg_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT entry FROM history ORDER BY downloaded_at DESC LIMIT %s",
-            (HISTORY_LIMIT,)).fetchall()
+            "SELECT entry FROM history WHERE client_id = %s "
+            "ORDER BY downloaded_at DESC LIMIT %s",
+            (client_id or "", HISTORY_LIMIT)).fetchall()
     return [r["entry"] for r in rows]
 
 
-def clear_history() -> None:
+def clear_history(client_id: str = "") -> None:
+    """Clear only this visitor's history."""
     if not USE_POSTGRES:
-        if os.path.exists(LEGACY_HISTORY_JSON):
-            os.remove(LEGACY_HISTORY_JSON)
+        with _history_lock:
+            history = [h for h in _json_history_load() if h.get("_client", "") != (client_id or "")]
+            if os.path.exists(LEGACY_HISTORY_JSON):
+                with open(LEGACY_HISTORY_JSON, "w", encoding="utf-8") as f:
+                    json.dump(history, f, indent=2, ensure_ascii=False)
         return
     with _pg_pool().connection() as conn:
-        conn.execute("DELETE FROM history")
+        conn.execute("DELETE FROM history WHERE client_id = %s", (client_id or "",))
         conn.commit()

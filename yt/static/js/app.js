@@ -1811,3 +1811,32 @@ function formatDate(iso) {
     }
 }
 
+
+// ─── Expired-file check for Save / ZIP links ─────────────────────────────
+// Files are deleted from the server after you save them, after a while if
+// nobody saves them, and whenever the server restarts. Check first so the
+// user gets a clear message instead of a broken download.
+document.addEventListener('click', async (event) => {
+    const link = event.target.closest('a[href^="/api/download-"]:not([data-checked])');
+    if (!link || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    event.preventDefault();
+    const href = link.getAttribute('href');
+    try {
+        const res = await fetch('/api/file-available?link=' + encodeURIComponent(href));
+        const data = await res.json();
+        if (!data.available) {
+            showToast('This file has expired and was deleted from the server. Please download it again.', 'error');
+            link.remove();
+            return;
+        }
+    } catch (e) {
+        // If the check itself fails, just try the download.
+    }
+    const a = document.createElement('a');
+    a.href = href;
+    a.dataset.checked = '1';
+    if (link.hasAttribute('download')) a.setAttribute('download', link.getAttribute('download'));
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+});
