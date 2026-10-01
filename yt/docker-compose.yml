@@ -27,6 +27,8 @@ services:
       - MAX_CONCURRENT=${MAX_CONCURRENT:-3}
       # If you have a domain behind a reverse proxy
       - PROXY_FIX=${PROXY_FIX:-1}
+      # Neon Postgres connection string (set in .env)
+      - DATABASE_URL=${DATABASE_URL}
     volumes:
       # Persist download history + Ghana cache across restarts
       - yt-data:/app/data

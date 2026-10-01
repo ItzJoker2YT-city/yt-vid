@@ -17,6 +17,7 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC
 
 import config
+import cache_db
 
 logger = logging.getLogger(__name__)
 
@@ -599,7 +600,7 @@ def _run_playlist(url, output_dir, quality, parent_cancel, parent_pause, dl_type
 
 
 def _save_history_entry(task, info, filepath):
-    """Append a completed download to the history file."""
+    """Record a completed download in the history table (Neon)."""
     entry = {
         "id": task.id,
         "title": info.get("title", task.title),
@@ -613,23 +614,7 @@ def _save_history_entry(task, info, filepath):
         "downloaded_at": datetime.now().isoformat(),
     }
 
-    history_file = config.HISTORY_DB
-    os.makedirs(os.path.dirname(history_file), exist_ok=True)
-
-    history = []
-    if os.path.exists(history_file):
-        try:
-            with open(history_file, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            history = []
-
-    history.insert(0, entry)
-    # Keep last 500 entries
-    history = history[:500]
-
-    with open(history_file, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
+    cache_db.add_history_entry(entry)
 
 
 def probe_url(url):
@@ -1094,27 +1079,24 @@ def search_artist_albums(artist, max_results=6):
 
 
 def get_history():
-    """Load download history from the JSON file."""
-    if os.path.exists(config.HISTORY_DB):
-        try:
-            with open(config.HISTORY_DB, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return []
-    return []
+    """Load download history from the database."""
+    try:
+        return cache_db.get_history()
+    except Exception as e:  # noqa: BLE001
+        logger.error("Failed to load history: %s", e)
+        return []
 
 
 def clear_history():
     """Clear the download history."""
-    if os.path.exists(config.HISTORY_DB):
-        os.remove(config.HISTORY_DB)
+    cache_db.clear_history()
     return True
 
 
 # ─── Direct MP3 Download (no yt-dlp — purely HTTP) ───────────────────────────
 
 def _save_history_entry_direct(task, filepath):
-    """Append a direct-download entry to the JSON history file."""
+    """Record a direct-download entry in the history table (Neon)."""
     entry = {
         "id": task.id,
         "title": task.title or os.path.basename(filepath).replace("_", " ").rsplit(".", 1)[0],
@@ -1128,21 +1110,7 @@ def _save_history_entry_direct(task, filepath):
         "downloaded_at": datetime.now().isoformat(),
     }
 
-    history_file = config.HISTORY_DB
-    os.makedirs(os.path.dirname(history_file), exist_ok=True)
-    history = []
-    if os.path.exists(history_file):
-        try:
-            with open(history_file, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            history = []
-
-    history.insert(0, entry)
-    history = history[:500]
-
-    with open(history_file, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
+    cache_db.add_history_entry(entry)
 
 
 def _stream_mp3(task, resp, out_path):

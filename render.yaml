@@ -1,0 +1,22 @@
+# Render Blueprint — deploys the YT-MP3 app on Render's free plan.
+# Render → New → Blueprint → pick this repo. You'll be asked for DATABASE_URL.
+services:
+  - type: web
+    name: yt-mp3
+    runtime: docker
+    plan: free
+    rootDir: yt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/settings
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "5000"
+      - key: PROXY_FIX
+        value: "1"
+      - key: DOWNLOAD_DIR
+        value: /tmp/YT-Downloads
+      - key: MAX_CONCURRENT
+        value: "1"
+      - key: DATABASE_URL
+        sync: false   # secret — you type it in on Render, never stored in GitHub

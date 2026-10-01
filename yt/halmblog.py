@@ -2,7 +2,7 @@
 Halmblog.com Ghana Music scraper — powered by requests + BeautifulSoup.
 Extracts song listings and direct MP3 file URLs.
 
-Uses a persistent SQLite cache (see cache_db.py) so repeat loads are instant.
+Uses a persistent Neon Postgres cache (see cache_db.py) so repeat loads are instant.
 New songs are detected by scraping page 1 periodically.
 """
 import os

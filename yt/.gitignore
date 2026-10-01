@@ -1,5 +1,6 @@
 # Secrets — never commit
 cookies.txt
+.env
 
 # Python
 __pycache__/

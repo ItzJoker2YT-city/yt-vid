@@ -313,3 +313,17 @@ yt/
 - 🇬🇭 **Ghana Music** — periodically refreshed feed from Halmblog.com with fast archive search and deep cache
 - 📥 **Queue** — pause/resume/cancel, download all as ZIP
 - 📋 **History** — persistent download history with re-download
+
+## Database (Neon Postgres)
+
+The app stores the Ghana music cache and download history in [Neon](https://neon.tech).
+
+1. Create a Neon project and copy the connection string (Dashboard → **Connect**, use the pooled one).
+2. Set it as `DATABASE_URL`, e.g. in `.env`:
+   ```
+   DATABASE_URL=postgresql://user:pass@ep-xxx-pooler.region.aws.neon.tech/neondb?sslmode=require
+   ```
+3. Start the app. Tables (`songs`, `meta`, `history`) are created automatically, and any existing
+   `data/ghana_music.db`, `data/ghana_music.json`, or `data/history.json` is imported on first run.
+
+If `DATABASE_URL` is not set, the app falls back to local SQLite/JSON files.

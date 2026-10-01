@@ -14,7 +14,12 @@ DEFAULT_DOWNLOAD_DIR = os.environ.get(
 )
 
 # ─── Database file for download history ──────────────────────────────────────
-HISTORY_DB = os.path.join(BASE_DIR, "data", "history.json")
+HISTORY_DB = os.path.join(BASE_DIR, "data", "history.json")  # legacy / local fallback only
+
+# ─── Neon Postgres database ──────────────────────────────────────────────────
+# Set DATABASE_URL to your Neon connection string (Dashboard → Connect).
+# Leave empty to use local SQLite/JSON files instead.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # ─── Supported audio quality options (kbps) ──────────────────────────────────
 QUALITY_OPTIONS = {
