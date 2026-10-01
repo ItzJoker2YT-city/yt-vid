@@ -44,6 +44,63 @@ halmblog_logger = logging.getLogger("halmblog")
 halmblog_logger.addHandler(handler)
 halmblog_logger.setLevel(logging.INFO)
 
+# ─── Download cleanup (public server: never keep files around) ──────────────
+# Files are deleted right after the user saves them (see stream_and_delete).
+# This janitor also removes anything left behind — files nobody collected,
+# cancelled/failed partials, temp ZIPs, empty playlist folders — once they
+# have not been touched for FILE_TTL_MINUTES. The folder is wiped on startup.
+
+def _purge_downloads(max_age_seconds):
+    import shutil
+    now = time.time()
+    root = config.DEFAULT_DOWNLOAD_DIR
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                if now - os.path.getmtime(full) >= max_age_seconds:
+                    os.remove(full)
+                    removed += 1
+            except OSError:
+                pass
+        if dirpath != root:
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                pass
+    # Stray temp ZIPs from /api/download-all and playlists
+    tmp = tempfile.gettempdir()
+    try:
+        for name in os.listdir(tmp):
+            full = os.path.join(tmp, name)
+            if name.startswith("ytmp3_") and name.endswith(".zip") and os.path.isfile(full) and now - os.path.getmtime(full) >= max_age_seconds:
+                os.remove(full)
+                removed += 1
+    except OSError:
+        pass
+    # Tell the UI that expired files are gone
+    for task in list(engine.active_downloads.values()):
+        if getattr(task, "filepath", "") and not os.path.exists(task.filepath):
+            task.filepath = ""
+    if removed:
+        app.logger.info(f"Cleanup: deleted {removed} leftover file(s)")
+
+
+def _start_janitor():
+    _purge_downloads(0)  # fresh start: nothing from a previous run survives
+    while True:
+        time.sleep(300)
+        try:
+            _purge_downloads(config.FILE_TTL_MINUTES * 60)
+        except Exception as e:  # noqa: BLE001
+            app.logger.error(f"Cleanup failed: {e}")
+
+
+if config.AUTO_DELETE_DOWNLOADS:
+    threading.Thread(target=_start_janitor, daemon=True, name="download-janitor").start()
+
 # ─── Cache Pre-warming ────────────────────────────────────────────────────────
 # Pre-warm search cache for top trending artists in the background so the
 # first user click hits the cache instead of waiting for yt-dlp.
@@ -149,7 +206,8 @@ def api_download():
     data = request.get_json(silent=True) or {}
     urls = data.get("urls", [])
     quality = data.get("quality", config.DEFAULT_QUALITY)
-    output_dir = data.get("output_dir", config.DEFAULT_DOWNLOAD_DIR)
+    # Public site: never let the browser choose where files are written.
+    output_dir = config.DEFAULT_DOWNLOAD_DIR
     trim_start = data.get("trim_start", None)
     trim_end = data.get("trim_end", None)
     dl_type = data.get("dl_type", "audio")
@@ -557,6 +615,18 @@ def stream_and_delete(file_path, original_tasks=None, task_ref=None):
                         t.filepath = ""  # Update state so UI knows it's gone
                     except Exception as e:
                         app.logger.error(f"Failed to delete original file {t.filepath}: {e}")
+            _purge_empty_dirs()
+
+def _purge_empty_dirs():
+    root = config.DEFAULT_DOWNLOAD_DIR
+    for dirpath, _dirs, _files in os.walk(root, topdown=False):
+        if dirpath != root:
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                pass
+
 
 @app.route("/api/download-file/<task_id>")
 def api_download_file(task_id):
@@ -656,7 +726,7 @@ def _generate_zip(tasks, base_filename):
         if scanned:
             task_file_map[task.id] = scanned[0][1]
 
-    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_zip = tempfile.NamedTemporaryFile(delete=False, prefix="ytmp3_", suffix=".zip")
     temp_zip_path = temp_zip.name
     temp_zip.close()
 

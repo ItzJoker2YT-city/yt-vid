@@ -18,5 +18,9 @@ services:
         value: /tmp/YT-Downloads
       - key: MAX_CONCURRENT
         value: "1"
+      - key: AUTO_DELETE_DOWNLOADS
+        value: "1"
+      - key: FILE_TTL_MINUTES
+        value: "30"
       - key: DATABASE_URL
         sync: false   # secret — you type it in on Render, never stored in GitHub

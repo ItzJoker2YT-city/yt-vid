@@ -754,16 +754,32 @@ def cancel_task(task_id):
         task._pause_event.set()  # Unblock if paused
         task.status = "error"
         task.error_message = "Cancelled by user"
+        _delete_task_file(task)
         return True
     return False
 
 
+def _delete_task_file(task):
+    """Delete a task's file from disk (public server: don't keep files)."""
+    if not config.AUTO_DELETE_DOWNLOADS:
+        return
+    path = getattr(task, "filepath", "") or ""
+    for p in (path, path + ".part") if path else ():
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError as e:
+            logger.warning("Could not delete %s: %s", p, e)
+    task.filepath = ""
+
+
 def remove_task(task_id):
-    """Remove a completed/failed task from the active list."""
+    """Remove a completed/failed task from the active list and delete its file."""
     with download_lock:
-        if task_id in active_downloads:
-            del active_downloads[task_id]
-            return True
+        task = active_downloads.pop(task_id, None)
+    if task:
+        _delete_task_file(task)
+        return True
     return False
 
 

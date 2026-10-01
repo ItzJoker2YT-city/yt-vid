@@ -13,6 +13,14 @@ DEFAULT_DOWNLOAD_DIR = os.environ.get(
     "DOWNLOAD_DIR", os.path.join(os.path.expanduser("~"), "Music", "YT-Downloads")
 )
 
+# ─── Auto-delete leftover downloads ─────────────────────────────────────────
+# Files are deleted as soon as the user saves them. Anything not collected
+# (or cancelled/failed partials) is deleted after this many minutes.
+FILE_TTL_MINUTES = int(os.environ.get("FILE_TTL_MINUTES", "30"))
+# On by default in Docker/Render (public server). Off for local runs so it
+# never wipes your personal ~/Music/YT-Downloads folder.
+AUTO_DELETE_DOWNLOADS = os.environ.get("AUTO_DELETE_DOWNLOADS", "").lower() in ("true", "1", "yes")
+
 # ─── Database file for download history ──────────────────────────────────────
 HISTORY_DB = os.path.join(BASE_DIR, "data", "history.json")  # legacy / local fallback only
 
