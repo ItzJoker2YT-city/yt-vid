@@ -13,6 +13,21 @@ DEFAULT_DOWNLOAD_DIR = os.environ.get(
     "DOWNLOAD_DIR", os.path.join(os.path.expanduser("~"), "Music", "YT-Downloads")
 )
 
+# ─── Auto-delete leftover downloads ─────────────────────────────────────────
+# Files are deleted as soon as the user saves them. Anything not collected
+# (or cancelled/failed partials) is deleted after this many minutes.
+FILE_TTL_MINUTES = int(os.environ.get("FILE_TTL_MINUTES", "30"))
+# On by default in Docker/Render (public server). Off for local runs so it
+# never wipes your personal ~/Music/YT-Downloads folder.
+AUTO_DELETE_DOWNLOADS = os.environ.get("AUTO_DELETE_DOWNLOADS", "").lower() in ("true", "1", "yes")
+
+# ─── Public-server protection ───────────────────────────────────────────────
+MAX_ACTIVE_PER_USER = int(os.environ.get("MAX_ACTIVE_PER_USER", "3"))   # running at once
+DOWNLOADS_PER_HOUR = int(os.environ.get("DOWNLOADS_PER_HOUR", "30"))    # per visitor
+SEARCHES_PER_10_MIN = int(os.environ.get("SEARCHES_PER_10_MIN", "40"))  # per visitor
+# Optional: set SITE_PASSWORD to require a password (any username) for the site.
+SITE_PASSWORD = os.environ.get("SITE_PASSWORD", "")
+
 # ─── Database file for download history ──────────────────────────────────────
 HISTORY_DB = os.path.join(BASE_DIR, "data", "history.json")  # legacy / local fallback only
 

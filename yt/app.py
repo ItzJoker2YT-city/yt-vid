@@ -14,7 +14,11 @@ from urllib.parse import quote as _url_quote
 from urllib.parse import urlsplit
 from logging.handlers import RotatingFileHandler
 
-from flask import Flask, render_template, request, jsonify, send_file, Response
+import hashlib
+import hmac
+from collections import defaultdict, deque
+
+from flask import Flask, render_template, request, jsonify, send_file, Response, g
 
 import config
 import engine
@@ -28,6 +32,117 @@ from halmblog import (
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.secret_key = os.urandom(24)
+
+# ─── Speed: gzip/brotli for pages + JSON, long cache for static files ───────
+try:
+    from flask_compress import Compress
+    app.config["COMPRESS_MIMETYPES"] = [
+        "text/html", "text/css", "application/javascript", "text/javascript",
+        "application/json", "image/svg+xml",
+    ]
+    Compress(app)
+except ImportError:  # optional dependency
+    pass
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 60 * 60 * 24 * 30  # 30 days (URLs are versioned)
+
+
+def _asset_version():
+    """Changes whenever app.js or style.css changes, so browsers re-download."""
+    h = hashlib.sha1()
+    for rel in ("static/js/app.js", "static/css/style.css"):
+        try:
+            with open(os.path.join(config.BASE_DIR, rel), "rb") as f:
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.hexdigest()[:10]
+
+
+ASSET_VERSION = _asset_version()
+
+
+# ─── Visitor identity (each IP gets its own queue + history) ────────────────
+# The IP is hashed with a server secret, so the database never stores raw IPs.
+_CLIENT_SALT = (os.environ.get("CLIENT_ID_SECRET") or config.DATABASE_URL or "yt-mp3").encode()
+
+
+def _client_ip():
+    # Render sits behind Cloudflare, which sets these and overwrites any
+    # value a visitor tries to fake.
+    for header in ("CF-Connecting-IP", "True-Client-IP"):
+        value = request.headers.get(header, "").strip()
+        if value:
+            return value
+    return request.remote_addr or "unknown"
+
+
+def _client_id(ip):
+    return hmac.new(_CLIENT_SALT, ip.encode(), hashlib.sha256).hexdigest()[:24]
+
+
+# ─── Optional site password (set SITE_PASSWORD to turn on) ──────────────────
+_OPEN_PATHS = ("/api/settings", "/static/")
+
+
+@app.before_request
+def _identify_visitor():
+    if config.SITE_PASSWORD and not request.path.startswith(_OPEN_PATHS):
+        auth = request.authorization
+        if not auth or not hmac.compare_digest(auth.password or "", config.SITE_PASSWORD):
+            return Response("Password required", 401,
+                            {"WWW-Authenticate": 'Basic realm="YT-MP3"'})
+    g.client_id = _client_id(_client_ip())
+    engine.current_client.set(g.client_id)
+
+
+# ─── Rate limiting (per visitor, in memory) ─────────────────────────────────
+_rate_hits = defaultdict(deque)
+_rate_lock = threading.Lock()
+
+
+def _rate_limited(kind, limit, window_seconds):
+    """Return True if this visitor went over `limit` actions in the window."""
+    now = time.time()
+    key = (kind, g.client_id)
+    with _rate_lock:
+        hits = _rate_hits[key]
+        while hits and now - hits[0] > window_seconds:
+            hits.popleft()
+        if len(hits) >= limit:
+            return True
+        hits.append(now)
+        if len(_rate_hits) > 10000:  # don't let the table grow forever
+            for k in [k for k, v in _rate_hits.items() if not v][:5000]:
+                _rate_hits.pop(k, None)
+    return False
+
+
+def _download_guard():
+    """Block a new download if this visitor is over the limits."""
+    active = [t for t in engine.get_client_tasks(g.client_id)
+              if t.status in ("queued", "downloading", "converting", "paused")]
+    if len(active) >= config.MAX_ACTIVE_PER_USER:
+        return jsonify({"error": f"You already have {len(active)} downloads running. "
+                                 "Wait for them to finish, then try again."}), 429
+    if _rate_limited("download", config.DOWNLOADS_PER_HOUR, 3600):
+        return jsonify({"error": f"Download limit reached ({config.DOWNLOADS_PER_HOUR} per hour). "
+                                 "Please try again later."}), 429
+    return None
+
+
+def _search_guard():
+    if _rate_limited("search", config.SEARCHES_PER_10_MIN, 600):
+        return jsonify({"error": "Too many searches. Please wait a few minutes."}), 429
+    return None
+
+
+def _my_task(task_id):
+    """Return the task only if it belongs to the current visitor."""
+    task = engine.get_task(task_id)
+    if task and task.client_id == g.client_id:
+        return task
+    return None
+
 
 # Ensure data directory exists
 os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
@@ -43,6 +158,70 @@ logging.getLogger("engine").addHandler(handler)
 halmblog_logger = logging.getLogger("halmblog")
 halmblog_logger.addHandler(handler)
 halmblog_logger.setLevel(logging.INFO)
+
+# ─── Download cleanup (public server: never keep files around) ──────────────
+# Files are deleted right after the user saves them (see stream_and_delete).
+# This janitor also removes anything left behind — files nobody collected,
+# cancelled/failed partials, temp ZIPs, empty playlist folders — once they
+# have not been touched for FILE_TTL_MINUTES. The folder is wiped on startup.
+
+def _purge_downloads(max_age_seconds):
+    import shutil
+    now = time.time()
+    root = config.DEFAULT_DOWNLOAD_DIR
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                if now - os.path.getmtime(full) >= max_age_seconds:
+                    os.remove(full)
+                    removed += 1
+            except OSError:
+                pass
+        if dirpath != root:
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                pass
+    # Stray temp ZIPs from /api/download-all and playlists
+    tmp = tempfile.gettempdir()
+    try:
+        for name in os.listdir(tmp):
+            full = os.path.join(tmp, name)
+            if name.startswith("ytmp3_") and name.endswith(".zip") and os.path.isfile(full) and now - os.path.getmtime(full) >= max_age_seconds:
+                os.remove(full)
+                removed += 1
+    except OSError:
+        pass
+    # Tell the UI that expired files are gone, and forget old finished tasks
+    for task in list(engine.active_downloads.values()):
+        if getattr(task, "filepath", "") and not os.path.exists(task.filepath):
+            task.filepath = ""
+        if task.status in ("done", "error") and not task.filepath and max_age_seconds:
+            try:
+                age = now - time.mktime(time.strptime(task.created_at[:19], "%Y-%m-%dT%H:%M:%S"))
+            except (TypeError, ValueError):
+                age = 0
+            if age >= max_age_seconds * 2:
+                engine.active_downloads.pop(task.id, None)
+    if removed:
+        app.logger.info(f"Cleanup: deleted {removed} leftover file(s)")
+
+
+def _start_janitor():
+    _purge_downloads(0)  # fresh start: nothing from a previous run survives
+    while True:
+        time.sleep(300)
+        try:
+            _purge_downloads(config.FILE_TTL_MINUTES * 60)
+        except Exception as e:  # noqa: BLE001
+            app.logger.error(f"Cleanup failed: {e}")
+
+
+if config.AUTO_DELETE_DOWNLOADS:
+    threading.Thread(target=_start_janitor, daemon=True, name="download-janitor").start()
 
 # ─── Cache Pre-warming ────────────────────────────────────────────────────────
 # Pre-warm search cache for top trending artists in the background so the
@@ -65,6 +244,13 @@ threading.Thread(target=_start_prewarm, daemon=True, name="cache-prewarm").start
 # ─── Ghana Music Auto-Update ──────────────────────────────────────────────────
 def _start_ghana_cache():
     import time
+    try:
+        # Load the saved song list from the database right away, so the site
+        # has songs to show before any scraping happens.
+        import cache_db
+        app.logger.info("Song list ready: %d songs", cache_db.warm_cache())
+    except Exception as e:
+        app.logger.warning("Could not preload song list: %s", e)
     time.sleep(2)
     try:
         # Fast build: listing only (1-2 HTTP requests)
@@ -138,7 +324,8 @@ threading.Thread(target=_start_ghana_cache, daemon=True, name="ghana-cache-build
 @app.route("/")
 def index():
     """Main page — the downloader UI."""
-    return render_template("index.html", default_quality=config.DEFAULT_QUALITY)
+    return render_template("index.html", default_quality=config.DEFAULT_QUALITY,
+                           asset_version=ASSET_VERSION)
 
 
 # ─── API Routes ───────────────────────────────────────────────────────────────
@@ -149,13 +336,17 @@ def api_download():
     data = request.get_json(silent=True) or {}
     urls = data.get("urls", [])
     quality = data.get("quality", config.DEFAULT_QUALITY)
-    output_dir = data.get("output_dir", config.DEFAULT_DOWNLOAD_DIR)
+    # Public site: never let the browser choose where files are written.
+    output_dir = config.DEFAULT_DOWNLOAD_DIR
     trim_start = data.get("trim_start", None)
     trim_end = data.get("trim_end", None)
     dl_type = data.get("dl_type", "audio")
 
     if not urls:
         return jsonify({"error": "No URLs provided"}), 400
+    blocked = _download_guard()
+    if blocked:
+        return blocked
 
     if dl_type not in ["audio", "video"]:
         dl_type = "audio"
@@ -187,6 +378,9 @@ def api_playlist_info():
     without starting a download. Used by the frontend to show a
     confirmation before queuing potentially hundreds of tracks.
     """
+    blocked = _search_guard()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     if not url:
@@ -199,13 +393,13 @@ def api_playlist_info():
 @app.route("/api/status")
 def api_status():
     """Get the status of all active downloads."""
-    return jsonify({"tasks": engine.get_all_tasks()})
+    return jsonify({"tasks": engine.get_all_tasks(g.client_id)})
 
 
 @app.route("/api/task/<task_id>")
 def api_task_status(task_id):
     """Get status of a single task."""
-    task = engine.get_task(task_id)
+    task = _my_task(task_id)
     if task:
         return jsonify(task.to_dict())
     return jsonify({"error": "Task not found"}), 404
@@ -214,7 +408,7 @@ def api_task_status(task_id):
 @app.route("/api/pause/<task_id>", methods=["POST"])
 def api_pause(task_id):
     """Pause a download."""
-    if engine.pause_task(task_id):
+    if _my_task(task_id) and engine.pause_task(task_id):
         return jsonify({"success": True})
     return jsonify({"error": "Cannot pause this task"}), 400
 
@@ -222,7 +416,7 @@ def api_pause(task_id):
 @app.route("/api/resume/<task_id>", methods=["POST"])
 def api_resume(task_id):
     """Resume a paused download."""
-    if engine.resume_task(task_id):
+    if _my_task(task_id) and engine.resume_task(task_id):
         return jsonify({"success": True})
     return jsonify({"error": "Cannot resume this task"}), 400
 
@@ -230,7 +424,7 @@ def api_resume(task_id):
 @app.route("/api/cancel/<task_id>", methods=["POST"])
 def api_cancel(task_id):
     """Cancel a download."""
-    if engine.cancel_task(task_id):
+    if _my_task(task_id) and engine.cancel_task(task_id):
         return jsonify({"success": True})
     return jsonify({"error": "Cannot cancel this task"}), 400
 
@@ -238,7 +432,7 @@ def api_cancel(task_id):
 @app.route("/api/remove/<task_id>", methods=["POST"])
 def api_remove(task_id):
     """Remove a finished task from the list."""
-    if engine.remove_task(task_id):
+    if _my_task(task_id) and engine.remove_task(task_id):
         return jsonify({"success": True})
     return jsonify({"error": "Task not found"}), 404
 
@@ -246,6 +440,9 @@ def api_remove(task_id):
 @app.route("/api/search", methods=["POST"])
 def api_search():
     """Search YouTube for videos."""
+    blocked = _search_guard()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     query = data.get("query", "").strip()
     if not query:
@@ -258,6 +455,9 @@ def api_search():
 @app.route("/api/artist-albums", methods=["POST"])
 def api_artist_albums():
     """Search YouTube for an artist's albums and playlists."""
+    blocked = _search_guard()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     artist = data.get("artist", "").strip()
     if not artist:
@@ -321,6 +521,9 @@ def api_ghana_music_search():
 @app.route("/api/ghana-music/search-next", methods=["POST"])
 def api_ghana_music_search_next():
     """Compatibility endpoint: same cache-backed pagination as search."""
+    blocked = _search_guard()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     query = str(data.get("query") or "").strip()[:120]
     try:
@@ -349,6 +552,9 @@ def _ghana_song_result(song):
 @app.route("/api/ghana-music/deep-cache", methods=["POST"])
 def api_ghana_music_deep_cache():
     """Trigger deep cache build/resume in the background."""
+    blocked = _search_guard()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     max_pages = min(data.get("max_pages", 50), 200)
     threading.Thread(
@@ -400,6 +606,9 @@ def api_ghana_music_download():
         return jsonify({"error": "Invalid fallback MP3 link"}), 400
     if thumbnail and not _is_ghana_url(thumbnail):
         thumbnail = ""
+    blocked = _download_guard()
+    if blocked:
+        return blocked
 
     try:
         tasks = engine.start_direct_download(
@@ -444,6 +653,9 @@ def api_ghana_music_youtube_download():
     quality = data.get("quality", config.DEFAULT_QUALITY)
     if not title and not artist:
         return jsonify({"error": "No song info provided"}), 400
+    blocked = _download_guard()
+    if blocked:
+        return blocked
 
     query = f"{artist} {title} official audio" if artist else f"{title} official audio"
     try:
@@ -471,7 +683,9 @@ def api_ghana_music_youtube_download():
 @app.route("/api/history")
 def api_history():
     """Get download history."""
-    return jsonify({"history": engine.get_history()})
+    history = [{k: v for k, v in h.items() if k != "filepath"}
+               for h in engine.get_history(g.client_id)]
+    return jsonify({"history": history})
 
 
 @app.route("/api/history-ids")
@@ -479,7 +693,7 @@ def api_history_ids():
     """Return lightweight set of video IDs + URLs already in history.
     Used by the frontend to show 'Already Downloaded' badges on search results.
     """
-    history = engine.get_history()
+    history = engine.get_history(g.client_id)
     ids = set()
     urls = set()
     for item in history:
@@ -493,7 +707,7 @@ def api_history_ids():
 @app.route("/api/history/clear", methods=["POST"])
 def api_clear_history():
     """Clear download history."""
-    engine.clear_history()
+    engine.clear_history(g.client_id)
     return jsonify({"success": True})
 
 
@@ -557,16 +771,48 @@ def stream_and_delete(file_path, original_tasks=None, task_ref=None):
                         t.filepath = ""  # Update state so UI knows it's gone
                     except Exception as e:
                         app.logger.error(f"Failed to delete original file {t.filepath}: {e}")
+            _purge_empty_dirs()
+
+def _purge_empty_dirs():
+    root = config.DEFAULT_DOWNLOAD_DIR
+    for dirpath, _dirs, _files in os.walk(root, topdown=False):
+        if dirpath != root:
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                pass
+
+
+@app.route("/api/file-available")
+def api_file_available():
+    """Tell the browser whether a Save / ZIP link still has a file behind it.
+    Files are deleted after saving, after FILE_TTL_MINUTES, and on restart."""
+    link = request.args.get("link", "")
+    m = re.match(r"^/api/download-file/([\w-]+)$", link)
+    if m:
+        task = _my_task(m.group(1))
+        ok = bool(task and task.filepath and os.path.exists(task.filepath))
+        return jsonify({"available": ok})
+    m = re.match(r"^/api/download-playlist/([\w-]+)$", link)
+    tasks = engine.get_client_tasks(g.client_id)
+    if m:
+        tasks = [t for t in tasks if t.playlist_id == m.group(1)]
+    elif link != "/api/download-all":
+        return jsonify({"available": False})
+    ok = any(t.status == "done" and t.filepath and os.path.exists(t.filepath) for t in tasks)
+    return jsonify({"available": ok})
+
 
 @app.route("/api/download-file/<task_id>")
 def api_download_file(task_id):
     """Serve a specific downloaded MP3/MP4 file, then delete it from the host."""
-    task = engine.get_task(task_id)
+    task = _my_task(task_id)
     if not task:
         # Check history if not in active tasks
-        history = engine.get_history()
+        history = engine.get_history(g.client_id)
         history_entry = next((item for item in history if item["id"] == task_id), None)
-        if history_entry and os.path.exists(history_entry["filepath"]):
+        if history_entry and history_entry.get("filepath") and os.path.exists(history_entry["filepath"]):
             mime_type, _ = mimetypes.guess_type(history_entry["filepath"])
             return Response(stream_and_delete(history_entry["filepath"]), headers={
                 "Content-Disposition": f"attachment; {_safe_disposition(history_entry['filename'])}",
@@ -590,7 +836,7 @@ def api_download_file(task_id):
 @app.route("/api/download-playlist/<playlist_id>")
 def api_download_playlist(playlist_id):
     """Generate and serve a ZIP file of all completed tracks in a playlist."""
-    tasks = [t for t in engine.active_downloads.values() if t.playlist_id == playlist_id and t.status == "done"]
+    tasks = [t for t in engine.get_client_tasks(g.client_id) if t.playlist_id == playlist_id and t.status == "done"]
 
     if not tasks:
         return jsonify({"error": "No completed tracks found for this playlist"}), 404
@@ -602,7 +848,7 @@ def api_download_playlist(playlist_id):
 @app.route("/api/download-all")
 def api_download_all():
     """Generate and serve a ZIP file of ALL completed tracks in the queue."""
-    tasks = [t for t in engine.active_downloads.values() if t.status == "done"]
+    tasks = [t for t in engine.get_client_tasks(g.client_id) if t.status == "done"]
 
     if not tasks:
         return jsonify({"error": "No completed tracks found in queue"}), 404
@@ -656,7 +902,7 @@ def _generate_zip(tasks, base_filename):
         if scanned:
             task_file_map[task.id] = scanned[0][1]
 
-    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_zip = tempfile.NamedTemporaryFile(delete=False, prefix="ytmp3_", suffix=".zip")
     temp_zip_path = temp_zip.name
     temp_zip.close()
 

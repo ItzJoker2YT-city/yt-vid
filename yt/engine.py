@@ -9,6 +9,7 @@ import uuid
 import shutil
 import logging
 import threading
+import contextvars
 from datetime import datetime
 
 import requests as _requests
@@ -137,12 +138,18 @@ import time as _time
 
 
 
+# The visitor (hashed IP) making the current request. Set by app.py before each
+# request; every task created during that request belongs to that visitor.
+current_client = contextvars.ContextVar("current_client", default="")
+
+
 class DownloadTask:
     """Represents a single download task with progress tracking."""
 
     def __init__(self, url, output_dir, quality, trim_start=None, trim_end=None,
                  playlist_id=None, playlist_title=None, track_index=None, track_total=None, dl_type="audio"):
         self.id = str(uuid.uuid4())[:8]
+        self.client_id = current_client.get()
         self.url = url
         self.fallback_url = None   # secondary download source (e.g. Wayback URL)
         self.output_dir = output_dir
@@ -614,7 +621,7 @@ def _save_history_entry(task, info, filepath):
         "downloaded_at": datetime.now().isoformat(),
     }
 
-    cache_db.add_history_entry(entry)
+    cache_db.add_history_entry(entry, getattr(task, "client_id", ""))
 
 
 def probe_url(url):
@@ -720,10 +727,17 @@ def get_task(task_id):
     return active_downloads.get(task_id)
 
 
-def get_all_tasks():
-    """Get all active download tasks."""
+def get_all_tasks(client_id=None):
+    """Get active download tasks (only this visitor's when client_id is given)."""
     with download_lock:
-        return [t.to_dict() for t in active_downloads.values()]
+        return [t.to_dict() for t in active_downloads.values()
+                if client_id is None or t.client_id == client_id]
+
+
+def get_client_tasks(client_id):
+    """Task objects owned by one visitor."""
+    with download_lock:
+        return [t for t in active_downloads.values() if t.client_id == client_id]
 
 
 def pause_task(task_id):
@@ -754,16 +768,32 @@ def cancel_task(task_id):
         task._pause_event.set()  # Unblock if paused
         task.status = "error"
         task.error_message = "Cancelled by user"
+        _delete_task_file(task)
         return True
     return False
 
 
+def _delete_task_file(task):
+    """Delete a task's file from disk (public server: don't keep files)."""
+    if not config.AUTO_DELETE_DOWNLOADS:
+        return
+    path = getattr(task, "filepath", "") or ""
+    for p in (path, path + ".part") if path else ():
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError as e:
+            logger.warning("Could not delete %s: %s", p, e)
+    task.filepath = ""
+
+
 def remove_task(task_id):
-    """Remove a completed/failed task from the active list."""
+    """Remove a completed/failed task from the active list and delete its file."""
     with download_lock:
-        if task_id in active_downloads:
-            del active_downloads[task_id]
-            return True
+        task = active_downloads.pop(task_id, None)
+    if task:
+        _delete_task_file(task)
+        return True
     return False
 
 
@@ -1078,18 +1108,18 @@ def search_artist_albums(artist, max_results=6):
 
 
 
-def get_history():
-    """Load download history from the database."""
+def get_history(client_id=""):
+    """Load this visitor's download history from the database."""
     try:
-        return cache_db.get_history()
+        return cache_db.get_history(client_id)
     except Exception as e:  # noqa: BLE001
         logger.error("Failed to load history: %s", e)
         return []
 
 
-def clear_history():
-    """Clear the download history."""
-    cache_db.clear_history()
+def clear_history(client_id=""):
+    """Clear this visitor's download history."""
+    cache_db.clear_history(client_id)
     return True
 
 
@@ -1110,7 +1140,7 @@ def _save_history_entry_direct(task, filepath):
         "downloaded_at": datetime.now().isoformat(),
     }
 
-    cache_db.add_history_entry(entry)
+    cache_db.add_history_entry(entry, getattr(task, "client_id", ""))
 
 
 def _stream_mp3(task, resp, out_path):

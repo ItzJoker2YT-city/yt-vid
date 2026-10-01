@@ -327,3 +327,16 @@ The app stores the Ghana music cache and download history in [Neon](https://neon
    `data/ghana_music.db`, `data/ghana_music.json`, or `data/history.json` is imported on first run.
 
 If `DATABASE_URL` is not set, the app falls back to local SQLite/JSON files.
+
+## Public-server settings (environment variables)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AUTO_DELETE_DOWNLOADS` | `1` in Docker | Delete every file after it's saved, and leftovers after `FILE_TTL_MINUTES` |
+| `FILE_TTL_MINUTES` | `30` | How long an unsaved file is kept |
+| `MAX_ACTIVE_PER_USER` | `3` | Downloads one visitor can run at once |
+| `DOWNLOADS_PER_HOUR` | `30` | Downloads per visitor per hour |
+| `SEARCHES_PER_10_MIN` | `40` | Searches per visitor per 10 minutes |
+| `SITE_PASSWORD` | _(empty)_ | Set it to require a password for the whole site |
+
+Each visitor (by IP) gets their own download queue and history. IPs are stored only as a salted hash.
